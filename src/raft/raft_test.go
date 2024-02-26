@@ -7,7 +7,7 @@ package raft
 // test with the original before submitting.
 
 import (
-    "../remote"     // NOTE: you **can** change this line as needed for your dev environment
+    "remote"     // NOTE: you **can** change this line as needed for your dev environment
     "fmt"
     "math/rand"
     "strconv"

@@ -3,7 +3,7 @@ package raft
 // 14-736 Lab 2 Raft implementation in go
 
 import (
-    "../remote"  // feel free to change to "remote" if appropriate for your dev environment
+    "remote"  // feel free to change to "remote" if appropriate for your dev environment
     "fmt"
     "math/rand"
     "strconv"
