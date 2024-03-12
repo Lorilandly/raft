@@ -3,9 +3,11 @@ package raft
 // 14-736 Lab 2 Raft implementation in go
 
 import (
+	"fmt"
 	"math/rand"
 	"remote" // feel free to change to "remote" if appropriate for your dev environment
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -80,16 +82,17 @@ type RaftPeer struct {
 	// volatile state
 	commitIndex int
 	lastApplied int
+	votedCount  int
+	mu          *sync.Mutex
 	// leader state
 	nextIndex  []int
 	matchIndex []int
 	status     Status
 	service    *remote.Service
 	newEntry   chan logEntry
-	isLeader   bool
-
 	// peers
-	peers []*RaftInterface
+	peers           []*RaftInterface
+	electionTimeout *time.Timer
 }
 
 // `NewRaftPeer` -- this method should create an instance of the above struct and return a pointer
@@ -123,10 +126,13 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		nextIndex:   []int{},
 		matchIndex:  []int{},
 		service:     nil,
+		mu:          &sync.Mutex{},
 		status:      FOLLOWER,
 		newEntry:    make(chan logEntry, 1),
+		votedCount:  0,
 		// vote:        make(chan bool, 1),
-		peers: []*RaftInterface{},
+		peers:           []*RaftInterface{},
+		electionTimeout: nil,
 	}
 
 	for i := port - id; i < port+num; i++ {
@@ -183,51 +189,34 @@ func (rf *RaftPeer) Activate() {
 
 	// 150-300ms timeout
 	timer := rand.Intn(150) + 150
+	rf.ResetElectionTimeout()
 
 	// if is the follower, listen to appendEntries and requestVote
 
 	go func() {
 		for {
+			fmt.Printf("peer %d status: %d\n", rf.id, rf.status)
 			if rf.status == FOLLOWER {
 				// if is follower, listen to appendEntries and requestVote
-				select {
-				case <-rf.newEntry:
-					// reset timer
-				// case <-rf.vote:
-				// 	// reset timer
-				// 	// vote for whoever req for vote
-				case <-time.After(time.Duration(timer) * time.Millisecond): // timeout
-					// reset timer
-					// become candidate
-					rf.status = CANDIDATE
-					rf.currentTerm++
-					rf.votedFor = rf.id
 
-					// send requestVote to all other peers
-					for _, peer := range rf.peers {
-						go func() {
-
-							// todo: implement requestVote
-							peer.RequestVote(rf.currentTerm, rf.id, 0, 0)
-						}()
-					}
-					// case <- : // receive vote
-					//     // when reqvote
-					//     if receivedVote > (len(rf.peers) + 1) / 2 {
-					//         rf.status = LEADER
-					//     }
-
-				}
-			} else {
+			} else if rf.status == LEADER {
 				// if is leader, send heartbeat to all other peers
-				for {
-					for _, peer := range rf.peers {
-						go func() {
-							peer.AppendEntries(-1, 0, 0, 0, []int{}, 0)
-						}()
-					}
-					time.Sleep(100 * time.Millisecond)
+				fmt.Printf("leader %d send heartbeat\n", rf.id)
+				for _, p := range rf.peers {
+					go func(p *RaftInterface) {
+						_, success, _ := p.AppendEntries(-1, rf.id, 0, 0, []int{}, 0)
+
+						if success {
+							rf.mu.Lock()
+							rf.nextIndex[rf.id] = len(rf.log)
+							rf.matchIndex[rf.id] = len(rf.log)
+							rf.mu.Unlock()
+						}
+
+					}(p)
 				}
+				// sleep until next heartbeat
+				time.Sleep(time.Duration(timer) * time.Millisecond / 3)
 			}
 		}
 	}()
@@ -276,15 +265,36 @@ func (rf *RaftPeer) Deactivate() {
 // service implementation for RaftInterface
 
 func (rf *RaftPeer) RequestVote(term int, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError) {
-	return 0, false, remote.RemoteObjectError{}
+	// if term < currentTerm, reject
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if term < rf.currentTerm {
+		return rf.currentTerm, false, remote.RemoteObjectError{}
+	}
+	fmt.Print(rf.id)
+	fmt.Println(" vote for ", candidateId)
+	rf.currentTerm = term
+	rf.votedFor = candidateId
+	rf.ResetElectionTimeout()
+	return rf.currentTerm, true, remote.RemoteObjectError{}
 }
 
 func (rf *RaftPeer) AppendEntries(term int, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.newEntry <- logEntry{Term: term}
+	if term > rf.currentTerm {
+		rf.currentTerm = term
+	}
 
-	rf.currentTerm = term
+	if term == -1 {
+		fmt.Print(rf.id)
+		fmt.Println(" receive heartbeat")
+	}
+	rf.ResetElectionTimeout()
 	return 0, true, remote.RemoteObjectError{}
 }
 
@@ -293,7 +303,6 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 }
 
 func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
-
 	status := StatusReport{
 		Index:     rf.commitIndex,
 		Term:      rf.currentTerm,
@@ -305,6 +314,63 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError) {
 	return StatusReport{}, remote.RemoteObjectError{}
+}
+
+func (rf *RaftPeer) ResetElectionTimeout() {
+	fmt.Printf("peer %d reset timer\n", rf.id)
+	if rf.electionTimeout != nil {
+		// 150-300ms timeout
+		rf.electionTimeout.Stop()
+		timer := rand.Intn(150) + 150
+		rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
+	} else {
+		timer := rand.Intn(150) + 150
+		rf.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, rf.startElection)
+	}
+
+}
+
+func (rf *RaftPeer) startElection() {
+	// reset timer
+	// become candidate
+	fmt.Print(rf.id)
+	fmt.Println(" timeout, become candidate")
+	rf.mu.Lock()
+	rf.status = CANDIDATE
+	rf.currentTerm++
+	rf.votedFor = rf.id
+	rf.votedCount = 1
+	rf.mu.Unlock()
+
+	// send requestVote to all other peers
+	for _, peer := range rf.peers {
+		go func(peer *RaftInterface) {
+			// todo: implement requestVote
+			term, accept, _ := peer.RequestVote(rf.currentTerm, rf.id, 0, 0)
+
+			if accept {
+				rf.mu.Lock()
+				rf.votedCount++
+				if rf.votedCount > (len(rf.peers)+1)/2 {
+					fmt.Print(rf.id)
+					fmt.Println("become leader")
+					rf.status = LEADER
+					// timer stop
+					fmt.Printf("leader %d stop timer\n", rf.id)
+					rf.electionTimeout.Stop()
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+			}
+			rf.mu.Lock()
+			if term > rf.currentTerm {
+				rf.currentTerm = term
+				rf.status = FOLLOWER
+			}
+			rf.mu.Unlock()
+		}(peer)
+	}
 }
 
 // general notes:

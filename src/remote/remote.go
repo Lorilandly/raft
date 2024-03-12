@@ -274,7 +274,6 @@ methods:
 
 			} else if field.Type.Out(j).Kind() == reflect.Struct {
 				// if the field is a struct, then we need to register the type
-				fmt.Println("[INFO]\tregistering type: ", reflect.New(field.Type.Out(j)).Elem().Interface())
 				gob.Register(reflect.New(field.Type.Out(j)).Elem().Interface())
 			}
 		}
@@ -458,7 +457,7 @@ func (serv *Service) handleConnection(conn net.Conn) {
 // It continues to retry sending the message until it is successfully sent or an error occurs.
 // Finally, it closes the socket.
 func SendReply(reply ReplyMsg, ls *LeakySocket) bool {
-	fmt.Println("[INFO]\tsending reply:", reply)
+	// fmt.Println("[INFO]\tsending reply:", reply)
 	defer ls.Close()
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -571,7 +570,6 @@ methods:
 				continue methods
 			} else if field.Type.Out(j).Kind() == reflect.Struct {
 				// if the field is a struct, then we need to register the type
-				fmt.Println("[INFO]\tregistering type: ", reflect.New(field.Type.Out(j)).Elem().Interface())
 				regInterface := reflect.New(field.Type.Out(j)).Elem().Interface()
 
 				gob.Register(regInterface)
@@ -640,8 +638,6 @@ func giveImplementation(fnt reflect.StructField, fnv reflect.Value, adr string) 
 
 		ret := []reflect.Value{}
 		for _, val := range reply.Reply {
-			fmt.Println("val: ", val)
-			fmt.Println("type: ", reflect.TypeOf(val))
 			ret = append(ret, reflect.ValueOf(val))
 		}
 		return ret
