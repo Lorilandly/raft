@@ -271,6 +271,11 @@ methods:
 		for j := 0; j < field.Type.NumOut(); j++ {
 			if field.Type.Out(j).String() == "remote.RemoteObjectError" {
 				continue methods
+
+			} else if field.Type.Out(j).Kind() == reflect.Struct {
+				// if the field is a struct, then we need to register the type
+				fmt.Println("[INFO]\tregistering type: ", reflect.New(field.Type.Out(j)).Elem().Interface())
+				gob.Register(reflect.New(field.Type.Out(j)).Elem().Interface())
 			}
 		}
 		return nil, errors.New("not remote function")
@@ -564,6 +569,12 @@ methods:
 			if field.Type.Out(j).String() == "remote.RemoteObjectError" {
 				giveImplementation(field, ifcVal.Field(i), adr)
 				continue methods
+			} else if field.Type.Out(j).Kind() == reflect.Struct {
+				// if the field is a struct, then we need to register the type
+				fmt.Println("[INFO]\tregistering type: ", reflect.New(field.Type.Out(j)).Elem().Interface())
+				regInterface := reflect.New(field.Type.Out(j)).Elem().Interface()
+
+				gob.Register(regInterface)
 			}
 		}
 		return errors.New("not remote function")
@@ -629,6 +640,8 @@ func giveImplementation(fnt reflect.StructField, fnv reflect.Value, adr string) 
 
 		ret := []reflect.Value{}
 		for _, val := range reply.Reply {
+			fmt.Println("val: ", val)
+			fmt.Println("type: ", reflect.TypeOf(val))
 			ret = append(ret, reflect.ValueOf(val))
 		}
 		return ret
