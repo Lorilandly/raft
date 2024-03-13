@@ -8,6 +8,7 @@ import (
 	"remote" // feel free to change to "remote" if appropriate for your dev environment
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -82,7 +83,7 @@ type RaftPeer struct {
 	// volatile state
 	commitIndex int
 	lastApplied int
-	votedCount  int
+	votedCount  atomic.Uint32
 	mu          *sync.Mutex
 	// leader state
 	nextIndex  []int
@@ -113,6 +114,8 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 	// starting from peer with `id = 0` and ending with `id = num-1`, so any peer who knows its own
 	// `id`, `port`, and `num` can determine the port number used by any other peer.
 
+	initLog()
+
 	// create client stubs for all other peers
 
 	sobj := &RaftPeer{
@@ -127,13 +130,13 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		service:     nil,
 		mu:          &sync.Mutex{},
 		status:      FOLLOWER,
-		votedCount:  0,
+		votedCount:  atomic.Uint32{},
 		// vote:        make(chan bool, 1),
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
 	}
 
-	for i := port - id; i < port+num; i++ {
+	for i := port - id; i < port-id+num; i++ {
 		if i == port {
 			continue
 		}
@@ -154,6 +157,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 	sobj.service = service
 
 	// create a new raft peer
+	Debug(dInfo, "S%d created\n", id)
 
 	return sobj
 }
@@ -199,7 +203,7 @@ func (rf *RaftPeer) Activate() {
 				// fmt.Printf("peer %d is follower\n", rf.id)
 			} else if rf.status == LEADER {
 				// if is leader, send heartbeat to all other peers
-				fmt.Printf("leader %d send heartbeat\n", rf.id)
+				Debug(dInfo, "S%d heartbeet ->\n", rf.id)
 				for _, p := range rf.peers {
 					go func(p *RaftInterface) {
 						p.AppendEntries(-1, rf.id, 0, 0, []int{}, 0)
@@ -268,7 +272,7 @@ func (rf *RaftPeer) RequestVote(term int, candidateId int, lastLogIndex int, las
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if term < rf.currentTerm {
+	if term < rf.currentTerm || rf.status == CANDIDATE {
 		return rf.currentTerm, false, remote.RemoteObjectError{}
 	}
 	fmt.Print(rf.id)
@@ -289,10 +293,8 @@ func (rf *RaftPeer) AppendEntries(term int, leaderId int, prevLogIndex int, prev
 		rf.currentTerm = term
 	}
 
-	if term == -1 {
-		fmt.Print(rf.id)
-		fmt.Println(" receive heartbeat")
-	}
+	Debug(dInfo, "S%d heartbeet <-\n", rf.id)
+
 	rf.ResetElectionTimeout()
 	return 0, true, remote.RemoteObjectError{}
 }
@@ -316,14 +318,12 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 }
 
 func (rf *RaftPeer) ResetElectionTimeout() {
-	fmt.Printf("peer %d reset timer\n", rf.id)
+	Debug(dTimer, "S%d reset timer\n", rf.id)
+	timer := rand.Intn(150) + 150
 	if rf.electionTimeout != nil {
 		// 150-300ms timeout
-		rf.electionTimeout.Stop()
-		timer := rand.Intn(150) + 150
 		rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
 	} else {
-		timer := rand.Intn(150) + 150
 		rf.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, rf.startElection)
 	}
 
@@ -333,12 +333,12 @@ func (rf *RaftPeer) startElection() {
 	// reset timer
 	// become candidate
 	fmt.Print(rf.id)
-	fmt.Println(" timeout, become candidate")
+	Debug(dTimer, "S%d timeout, become candidate\n", rf.id)
 	rf.mu.Lock()
 	rf.status = CANDIDATE
 	rf.currentTerm++
 	rf.votedFor = rf.id
-	rf.votedCount = 1
+	rf.votedCount.Store(1)
 	rf.mu.Unlock()
 
 	// send requestVote to all other peers
@@ -348,16 +348,13 @@ func (rf *RaftPeer) startElection() {
 			term, accept, _ := peer.RequestVote(rf.currentTerm, rf.id, 0, 0)
 
 			if accept {
-				rf.mu.Lock()
-				rf.votedCount++
-				if rf.votedCount > (len(rf.peers)+1)/2 {
-					fmt.Print(rf.id)
-					fmt.Println("become leader")
+				rf.votedCount.Add(1)
+				if int(rf.votedCount.Load()) > (len(rf.peers)+1)/2 {
+					Debug(dLeader, "S%d become leader\n", rf.id)
 					rf.status = LEADER
 					// timer stop
-					fmt.Printf("leader %d stop timer\n", rf.id)
+					Debug(dTimer, "S%d stop timer\n", rf.id)
 					rf.electionTimeout.Stop()
-					rf.mu.Unlock()
 					return
 				}
 				rf.mu.Unlock()
