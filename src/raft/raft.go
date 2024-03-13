@@ -89,7 +89,6 @@ type RaftPeer struct {
 	matchIndex []int
 	status     Status
 	service    *remote.Service
-	newEntry   chan logEntry
 	// peers
 	peers           []*RaftInterface
 	electionTimeout *time.Timer
@@ -128,7 +127,6 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		service:     nil,
 		mu:          &sync.Mutex{},
 		status:      FOLLOWER,
-		newEntry:    make(chan logEntry, 1),
 		votedCount:  0,
 		// vote:        make(chan bool, 1),
 		peers:           []*RaftInterface{},
@@ -195,29 +193,30 @@ func (rf *RaftPeer) Activate() {
 
 	go func() {
 		for {
-			fmt.Printf("peer %d status: %d\n", rf.id, rf.status)
+			rf.mu.Lock()
 			if rf.status == FOLLOWER {
 				// if is follower, listen to appendEntries and requestVote
-
+				// fmt.Printf("peer %d is follower\n", rf.id)
 			} else if rf.status == LEADER {
 				// if is leader, send heartbeat to all other peers
 				fmt.Printf("leader %d send heartbeat\n", rf.id)
 				for _, p := range rf.peers {
 					go func(p *RaftInterface) {
-						_, success, _ := p.AppendEntries(-1, rf.id, 0, 0, []int{}, 0)
+						p.AppendEntries(-1, rf.id, 0, 0, []int{}, 0)
 
-						if success {
-							rf.mu.Lock()
-							rf.nextIndex[rf.id] = len(rf.log)
-							rf.matchIndex[rf.id] = len(rf.log)
-							rf.mu.Unlock()
-						}
+						// if success {
+						// 	// rf.mu.Lock()
+						// 	// // rf.nextIndex[rf.id] = len(rf.log)
+						// 	// // rf.matchIndex[rf.id] = len(rf.log)
+						// 	// rf.mu.Unlock()
+						// }
 
 					}(p)
 				}
 				// sleep until next heartbeat
 				time.Sleep(time.Duration(timer) * time.Millisecond / 3)
 			}
+			rf.mu.Unlock()
 		}
 	}()
 
@@ -285,7 +284,7 @@ func (rf *RaftPeer) AppendEntries(term int, leaderId int, prevLogIndex int, prev
 	// to reset timer
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.newEntry <- logEntry{Term: term}
+	// rf.newEntry <- logEntry{Term: term}
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 	}
@@ -306,7 +305,7 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 	status := StatusReport{
 		Index:     rf.commitIndex,
 		Term:      rf.currentTerm,
-		Leader:    true,
+		Leader:    rf.status == LEADER,
 		CallCount: rf.service.GetCount(),
 	}
 	return status, remote.RemoteObjectError{}
