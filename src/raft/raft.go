@@ -19,6 +19,7 @@ const (
 	FOLLOWER Status = iota
 	CANDIDATE
 	LEADER
+	DOWN
 )
 
 // StatusReport struct sent from Raft node to Controller in response to command and status requests.
@@ -187,7 +188,9 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 //
 // TODO: implement the `Activate` method
 func (rf *RaftPeer) Activate() {
+	Debug(dWarn, "S%d activated\n", rf.id)
 	rf.service.Start()
+	rf.status = FOLLOWER
 
 	// 150-300ms timeout
 	timer := rand.Intn(150) + 150
@@ -241,6 +244,8 @@ func (rf *RaftPeer) Activate() {
 //
 // TODO: implement the `Deactivate` method
 func (rf *RaftPeer) Deactivate() {
+	Debug(dWarn, "S%d deactivated\n", rf.id)
+	rf.status = DOWN
 	rf.service.Stop()
 }
 
