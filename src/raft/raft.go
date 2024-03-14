@@ -192,30 +192,7 @@ func (rf *RaftPeer) Activate() {
 	rf.service.Start()
 	rf.status = FOLLOWER
 
-	// 150-300ms timeout
-	timer := rand.Intn(150) + 150
 	rf.ResetElectionTimeout()
-
-	// if is the follower, listen to appendEntries and requestVote
-
-	go func() {
-		for {
-			rf.mu.Lock()
-			if rf.status == LEADER {
-				// if is leader, send heartbeat to all other peers
-				Debug(dInfo, "S%d heartbeet ->\n", rf.id)
-				for _, p := range rf.peers {
-					go func(p *RaftInterface) {
-						p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, []int{}, 0)
-					}(p)
-				}
-				// sleep until next heartbeat
-				time.Sleep(time.Duration(timer) * time.Millisecond / 3)
-			}
-			rf.mu.Unlock()
-		}
-	}()
-
 }
 
 // `Deactivate` -- this method performs the "inverse" operation to `Activate`, namely to emulate
@@ -236,6 +213,24 @@ func (rf *RaftPeer) Deactivate() {
 	Debug(dWarn, "S%d deactivated\n", rf.id)
 	rf.status = DOWN
 	rf.service.Stop()
+	rf.electionTimeout.Stop()
+}
+
+func (rf *RaftPeer) LeaderThread() {
+	rf.electionTimeout.Stop()
+	// 150-300ms timeout
+	timer := rand.Intn(150) + 150
+	for rf.status == LEADER {
+		// send heartbeat to all other peers
+		Debug(dInfo, "S%d heartbeet ->\n", rf.id)
+		for _, p := range rf.peers {
+			go func(p *RaftInterface) {
+				p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, []int{}, 0)
+			}(p)
+		}
+		// sleep until next heartbeat
+		time.Sleep(time.Duration(timer) * time.Millisecond / 3)
+	}
 }
 
 // TODO: implement remote method calls from other Raft peers:
@@ -364,7 +359,7 @@ func (rf *RaftPeer) startElection() {
 					rf.status = LEADER
 					// timer stop
 					Debug(dTimer, "S%d stop timer\n", rf.id)
-					rf.electionTimeout.Stop()
+					go rf.LeaderThread()
 					return
 				}
 			}
