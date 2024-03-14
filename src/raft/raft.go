@@ -3,6 +3,7 @@ package raft
 // 14-736 Lab 2 Raft implementation in go
 
 import (
+	"encoding/gob"
 	"fmt"
 	"math/rand"
 	"remote" // feel free to change to "remote" if appropriate for your dev environment
@@ -64,8 +65,8 @@ type logEntry struct {
 //     and reply back to the Controller with a StatusReport struct as defined above. it must be
 //     implemented as given, or the test code will not function correctly.  more detail below
 type RaftInterface struct {
-	RequestVote     func(term int32, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError)                               // TODO: define function type
-	AppendEntries   func(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) // TODO: define function type
+	RequestVote     func(term int32, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError)
+	AppendEntries   func(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []Entry, leaderCommit int) (int, bool, remote.RemoteObjectError) // TODO: define function type
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -80,7 +81,7 @@ type RaftPeer struct {
 	id          int
 	currentTerm atomic.Int32
 	votedFor    int
-	log         []int
+	log         []Entry
 	// volatile state
 	commitIndex int
 	lastApplied int
@@ -91,9 +92,15 @@ type RaftPeer struct {
 	matchIndex []int
 	status     Status
 	service    *remote.Service
+	entryCh    chan Entry
 	// peers
 	peers           []*RaftInterface
 	electionTimeout *time.Timer
+}
+
+type Entry struct {
+	Term int
+	Cmd  int
 }
 
 // `NewRaftPeer` -- this method should create an instance of the above struct and return a pointer
@@ -114,7 +121,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 	// port numbers are used for each Raft peer.  the Controller assigns these port numbers sequentially
 	// starting from peer with `id = 0` and ending with `id = num-1`, so any peer who knows its own
 	// `id`, `port`, and `num` can determine the port number used by any other peer.
-
+	gob.Register([]Entry{})
 	initLog()
 
 	// create client stubs for all other peers
@@ -123,7 +130,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		id:          id,
 		currentTerm: atomic.Int32{},
 		votedFor:    -1,
-		log:         []int{},
+		log:         []Entry{},
 		commitIndex: 0,
 		lastApplied: 0,
 		nextIndex:   []int{},
@@ -132,6 +139,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		mu:          &sync.Mutex{},
 		status:      FOLLOWER,
 		votedCount:  atomic.Int32{},
+		entryCh:     make(chan Entry, 1),
 		// vote:        make(chan bool, 1),
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
@@ -219,17 +227,38 @@ func (rf *RaftPeer) Deactivate() {
 func (rf *RaftPeer) LeaderThread() {
 	rf.electionTimeout.Stop()
 	// 150-300ms timeout
-	timer := rand.Intn(150) + 150
+	timer := time.NewTimer(time.Duration(rand.Intn(50)+50) * time.Millisecond)
+
+	entries := []Entry{}
 	for rf.status == LEADER {
-		// send heartbeat to all other peers
-		Debug(dInfo, "S%d heartbeet ->\n", rf.id)
-		for _, p := range rf.peers {
-			go func(p *RaftInterface) {
-				p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, []int{}, 0)
-			}(p)
+		select {
+		case <-timer.C:
+			rf.sendAppendEntries(entries)
+			entries = []Entry{}
+			timer.Stop()
+			timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
+		case entry := <-rf.entryCh:
+			entries = append(entries, entry)
 		}
-		// sleep until next heartbeat
-		time.Sleep(time.Duration(timer) * time.Millisecond / 3)
+	}
+	timer.Stop()
+	Debug(dLeader, "S%d stop leader thread\n", rf.id)
+}
+
+func (rf *RaftPeer) sendAppendEntries(entries []Entry) {
+	Debug(dInfo, "S%d sendAppendEntries\n", rf.id)
+	if len(entries) > 0 {
+		Debug(dLog, "S%d num entry %d\n", rf.id, len(rf.log))
+	}
+	rf.log = append(rf.log, entries...)
+	rf.commitIndex += len(entries)
+	for _, p := range rf.peers {
+		go func(p *RaftInterface) {
+			_, _, err := p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, entries, 0)
+			if err != (remote.RemoteObjectError{}) {
+				Debug(dError, "S%d sendAppendEntries error: %s\n", rf.id, err.Err)
+			}
+		}(p)
 	}
 }
 
@@ -278,7 +307,7 @@ func (rf *RaftPeer) RequestVote(term int32, candidateId int, lastLogIndex int, l
 	return int(currentTerm), true, remote.RemoteObjectError{}
 }
 
-func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []Entry, leaderCommit int) (int, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
 	var currentTerm int32
@@ -296,14 +325,31 @@ func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, pr
 		}
 	}
 
-	Debug(dInfo, "S%d heartbeet <-\n", rf.id)
+	Debug(dInfo, "S%d heartbeet <-%d, %d\n", rf.id, len(rf.log), len(entries))
+	rf.mu.Lock()
+	rf.log = append(rf.log, entries...)
+	rf.commitIndex += len(entries)
+	rf.mu.Unlock()
 
 	rf.ResetElectionTimeout()
 	return int(currentTerm), true, remote.RemoteObjectError{}
 }
 
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError) {
-	return 0, remote.RemoteObjectError{}
+
+	// if commitIndex < len(rf.log) {
+	// 	return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
+	// }
+	Debug(dLog, "S%d get committed cmd %d, %d\n", rf.id, commitIndex, len(rf.log))
+	if len(rf.log) != rf.commitIndex {
+		Debug(dWarn, "S%d inconsistent commitIndex %d, %d\n", rf.id, len(rf.log), rf.commitIndex)
+	}
+	if commitIndex < rf.commitIndex {
+		return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
+	}
+	return -1, remote.RemoteObjectError{
+		Err: "commitIndex is greater than log length",
+	}
 }
 
 func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
@@ -317,7 +363,26 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 }
 
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError) {
-	return StatusReport{}, remote.RemoteObjectError{}
+	Debug(dClient, "S%d new command %d\n", rf.id, cmd)
+
+	if rf.status != LEADER {
+		return StatusReport{}, remote.RemoteObjectError{
+			Err: "not leader",
+		}
+	}
+	rf.entryCh <- Entry{
+		Term: int(rf.currentTerm.Load()),
+		Cmd:  cmd,
+	}
+
+	status := StatusReport{
+		Index:     rf.commitIndex,
+		Term:      int(rf.currentTerm.Load()),
+		Leader:    rf.status == LEADER,
+		CallCount: rf.service.GetCount(),
+	}
+
+	return status, remote.RemoteObjectError{}
 }
 
 func (rf *RaftPeer) ResetElectionTimeout() {
@@ -329,7 +394,6 @@ func (rf *RaftPeer) ResetElectionTimeout() {
 	} else {
 		rf.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, rf.startElection)
 	}
-
 }
 
 func (rf *RaftPeer) startElection() {
