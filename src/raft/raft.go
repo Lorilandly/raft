@@ -64,8 +64,8 @@ type logEntry struct {
 //     and reply back to the Controller with a StatusReport struct as defined above. it must be
 //     implemented as given, or the test code will not function correctly.  more detail below
 type RaftInterface struct {
-	RequestVote     func(term int, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError)                               // TODO: define function type
-	AppendEntries   func(term int, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) // TODO: define function type
+	RequestVote     func(term int32, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError)                               // TODO: define function type
+	AppendEntries   func(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) // TODO: define function type
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -78,13 +78,13 @@ type RaftInterface struct {
 type RaftPeer struct {
 	// persistent state
 	id          int
-	currentTerm int
+	currentTerm atomic.Int32
 	votedFor    int
 	log         []int
 	// volatile state
 	commitIndex int
 	lastApplied int
-	votedCount  atomic.Uint32
+	votedCount  atomic.Int32
 	mu          *sync.Mutex
 	// leader state
 	nextIndex  []int
@@ -121,7 +121,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 
 	sobj := &RaftPeer{
 		id:          id,
-		currentTerm: 0,
+		currentTerm: atomic.Int32{},
 		votedFor:    -1,
 		log:         []int{},
 		commitIndex: 0,
@@ -131,7 +131,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		service:     nil,
 		mu:          &sync.Mutex{},
 		status:      FOLLOWER,
-		votedCount:  atomic.Uint32{},
+		votedCount:  atomic.Int32{},
 		// vote:        make(chan bool, 1),
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
@@ -201,23 +201,12 @@ func (rf *RaftPeer) Activate() {
 	go func() {
 		for {
 			rf.mu.Lock()
-			if rf.status == FOLLOWER {
-				// if is follower, listen to appendEntries and requestVote
-				// fmt.Printf("peer %d is follower\n", rf.id)
-			} else if rf.status == LEADER {
+			if rf.status == LEADER {
 				// if is leader, send heartbeat to all other peers
 				Debug(dInfo, "S%d heartbeet ->\n", rf.id)
 				for _, p := range rf.peers {
 					go func(p *RaftInterface) {
-						p.AppendEntries(-1, rf.id, 0, 0, []int{}, 0)
-
-						// if success {
-						// 	// rf.mu.Lock()
-						// 	// // rf.nextIndex[rf.id] = len(rf.log)
-						// 	// // rf.matchIndex[rf.id] = len(rf.log)
-						// 	// rf.mu.Unlock()
-						// }
-
+						p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, []int{}, 0)
 					}(p)
 				}
 				// sleep until next heartbeat
@@ -272,36 +261,50 @@ func (rf *RaftPeer) Deactivate() {
 // the updated status after the new command was handled.
 // service implementation for RaftInterface
 
-func (rf *RaftPeer) RequestVote(term int, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) RequestVote(term int32, candidateId int, lastLogIndex int, lastLogTerm int) (int, bool, remote.RemoteObjectError) {
 	// if term < currentTerm, reject
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if term < rf.currentTerm || rf.status == CANDIDATE {
-		return rf.currentTerm, false, remote.RemoteObjectError{}
+	var currentTerm int32
+	for {
+		currentTerm = rf.currentTerm.Load()
+		if term > currentTerm && rf.status != CANDIDATE {
+			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
+				break
+			}
+		} else {
+			return int(currentTerm), false, remote.RemoteObjectError{
+				Err: "term is less than current term",
+			}
+		}
 	}
-	fmt.Print(rf.id)
-	fmt.Println(" vote for ", candidateId)
-	rf.currentTerm = term
+	Debug(dVote, "S%d vote for %d\n", rf.id, candidateId)
+	rf.status = FOLLOWER
 	rf.votedFor = candidateId
 	rf.ResetElectionTimeout()
-	return rf.currentTerm, true, remote.RemoteObjectError{}
+	return int(currentTerm), true, remote.RemoteObjectError{}
 }
 
-func (rf *RaftPeer) AppendEntries(term int, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, prevLogTerm int, entries []int, leaderCommit int) (int, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// rf.newEntry <- logEntry{Term: term}
-	if term > rf.currentTerm {
-		rf.currentTerm = term
+	var currentTerm int32
+	for {
+		currentTerm = rf.currentTerm.Load()
+		if term >= currentTerm {
+			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
+				break
+			}
+		} else {
+			Debug(dError, "S%d term %d < %d, ignore\n", rf.id, term, currentTerm)
+			return int(rf.currentTerm.Load()), false, remote.RemoteObjectError{
+				Err: "term is less than current term",
+			}
+		}
 	}
 
 	Debug(dInfo, "S%d heartbeet <-\n", rf.id)
 
 	rf.ResetElectionTimeout()
-	return 0, true, remote.RemoteObjectError{}
+	return int(currentTerm), true, remote.RemoteObjectError{}
 }
 
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError) {
@@ -311,7 +314,7 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 	status := StatusReport{
 		Index:     rf.commitIndex,
-		Term:      rf.currentTerm,
+		Term:      int(rf.currentTerm.Load()),
 		Leader:    rf.status == LEADER,
 		CallCount: rf.service.GetCount(),
 	}
@@ -339,9 +342,10 @@ func (rf *RaftPeer) startElection() {
 	// become candidate
 	fmt.Print(rf.id)
 	Debug(dTimer, "S%d timeout, become candidate\n", rf.id)
+	rf.ResetElectionTimeout()
 	rf.mu.Lock()
 	rf.status = CANDIDATE
-	rf.currentTerm++
+	term := rf.currentTerm.Add(1)
 	rf.votedFor = rf.id
 	rf.votedCount.Store(1)
 	rf.mu.Unlock()
@@ -350,26 +354,20 @@ func (rf *RaftPeer) startElection() {
 	for _, peer := range rf.peers {
 		go func(peer *RaftInterface) {
 			// todo: implement requestVote
-			term, accept, _ := peer.RequestVote(rf.currentTerm, rf.id, 0, 0)
+			_, accept, _ := peer.RequestVote(term, rf.id, 0, 0)
 
 			if accept {
-				rf.votedCount.Add(1)
-				if int(rf.votedCount.Load()) > (len(rf.peers)+1)/2 {
-					Debug(dLeader, "S%d become leader\n", rf.id)
+				votes := rf.votedCount.Add(1)
+				if int(votes) == (len(rf.peers)+1)/2+1 {
+					// become leader
+					Debug(dLeader, "S%d received more than half votes, become leader\n", rf.id)
 					rf.status = LEADER
 					// timer stop
 					Debug(dTimer, "S%d stop timer\n", rf.id)
 					rf.electionTimeout.Stop()
 					return
 				}
-				rf.mu.Unlock()
 			}
-			rf.mu.Lock()
-			if term > rf.currentTerm {
-				rf.currentTerm = term
-				rf.status = FOLLOWER
-			}
-			rf.mu.Unlock()
 		}(peer)
 	}
 }
