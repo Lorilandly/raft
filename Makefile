@@ -10,7 +10,7 @@ MKARGS = -timeout 3600s
 
 # compile the package
 build:
-	cd src/$(PKGNAME); go build $(PKGNAME).go
+	cd src/$(PKGNAME); go build $(PKGNAME)
 
 # run tests on the package
 final: build

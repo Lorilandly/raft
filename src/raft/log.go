@@ -5,11 +5,12 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
 var debugStart time.Time
-var debugVerbosity int
+var debugVerbosity atomic.Bool
 
 type logTopic string
 
@@ -32,21 +33,20 @@ const (
 )
 
 func initLog() {
-	debugVerbosity = getVerbosity()
-	debugVerbosity = 1
+	if !debugVerbosity.CompareAndSwap(false, true) {
+		return
+	}
 	debugStart = time.Now()
 
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
 func Debug(topic logTopic, format string, a ...interface{}) {
-	if debugVerbosity >= 1 {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
-		format = prefix + format
-		log.Printf(format, a...)
-	}
+	time := time.Since(debugStart).Microseconds()
+	time /= 100
+	prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+	format = prefix + format
+	log.Printf(format, a...)
 }
 
 // Retrieve the verbosity level from an environment variable

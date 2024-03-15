@@ -14,10 +14,8 @@ import (
 )
 
 // Status -- this is a custom type that you can use to represent the current status of a Raft peer.
-type Status int
-
 const (
-	FOLLOWER Status = iota
+	FOLLOWER int32 = iota
 	CANDIDATE
 	LEADER
 	DOWN
@@ -80,17 +78,16 @@ type RaftPeer struct {
 	// persistent state
 	id          int
 	currentTerm atomic.Int32
-	votedFor    int
 	log         []Entry
 	// volatile state
-	commitIndex int
+	commitIndex atomic.Uint64
 	lastApplied int
 	votedCount  atomic.Int32
 	mu          *sync.Mutex
 	// leader state
 	nextIndex  []int
 	matchIndex []int
-	status     Status
+	status     int32
 	service    *remote.Service
 	entryCh    chan Entry
 	// peers
@@ -129,9 +126,8 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 	sobj := &RaftPeer{
 		id:          id,
 		currentTerm: atomic.Int32{},
-		votedFor:    -1,
 		log:         []Entry{},
-		commitIndex: 0,
+		commitIndex: atomic.Uint64{},
 		lastApplied: 0,
 		nextIndex:   []int{},
 		matchIndex:  []int{},
@@ -144,6 +140,9 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
 	}
+
+	timer := rand.Intn(150) + 150
+	sobj.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, sobj.startElection)
 
 	for i := port - id; i < port-id+num; i++ {
 		if i == port {
@@ -198,7 +197,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 func (rf *RaftPeer) Activate() {
 	Debug(dWarn, "S%d activated\n", rf.id)
 	rf.service.Start()
-	rf.status = FOLLOWER
+	atomic.SwapInt32(&rf.status, FOLLOWER)
 
 	rf.ResetElectionTimeout()
 }
@@ -219,7 +218,7 @@ func (rf *RaftPeer) Activate() {
 // TODO: implement the `Deactivate` method
 func (rf *RaftPeer) Deactivate() {
 	Debug(dWarn, "S%d deactivated\n", rf.id)
-	rf.status = DOWN
+	atomic.SwapInt32(&rf.status, DOWN)
 	rf.service.Stop()
 	rf.electionTimeout.Stop()
 }
@@ -230,7 +229,7 @@ func (rf *RaftPeer) LeaderThread() {
 	timer := time.NewTimer(time.Duration(rand.Intn(50)+50) * time.Millisecond)
 
 	entries := []Entry{}
-	for rf.status == LEADER {
+	for atomic.LoadInt32(&rf.status) == LEADER {
 		select {
 		case <-timer.C:
 			rf.sendAppendEntries(entries)
@@ -247,11 +246,13 @@ func (rf *RaftPeer) LeaderThread() {
 
 func (rf *RaftPeer) sendAppendEntries(entries []Entry) {
 	Debug(dInfo, "S%d sendAppendEntries\n", rf.id)
+	rf.mu.Lock()
 	if len(entries) > 0 {
 		Debug(dLog, "S%d num entry %d\n", rf.id, len(rf.log))
 	}
 	rf.log = append(rf.log, entries...)
-	rf.commitIndex += len(entries)
+	rf.mu.Unlock()
+	rf.commitIndex.Add(uint64(len(entries)))
 	for _, p := range rf.peers {
 		go func(p *RaftInterface) {
 			_, _, err := p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, entries, 0)
@@ -290,7 +291,7 @@ func (rf *RaftPeer) RequestVote(term int32, candidateId int, lastLogIndex int, l
 	var currentTerm int32
 	for {
 		currentTerm = rf.currentTerm.Load()
-		if term > currentTerm && rf.status != CANDIDATE {
+		if term > currentTerm && atomic.LoadInt32(&rf.status) != CANDIDATE {
 			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
 				break
 			}
@@ -301,8 +302,7 @@ func (rf *RaftPeer) RequestVote(term int32, candidateId int, lastLogIndex int, l
 		}
 	}
 	Debug(dVote, "S%d vote for %d\n", rf.id, candidateId)
-	rf.status = FOLLOWER
-	rf.votedFor = candidateId
+	atomic.SwapInt32(&rf.status, FOLLOWER)
 	rf.ResetElectionTimeout()
 	return int(currentTerm), true, remote.RemoteObjectError{}
 }
@@ -325,11 +325,11 @@ func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, pr
 		}
 	}
 
-	Debug(dInfo, "S%d heartbeet <-%d, %d\n", rf.id, len(rf.log), len(entries))
 	rf.mu.Lock()
+	Debug(dInfo, "S%d heartbeet <-%d, %d\n", rf.id, len(rf.log), len(entries))
 	rf.log = append(rf.log, entries...)
-	rf.commitIndex += len(entries)
 	rf.mu.Unlock()
+	rf.commitIndex.Add(uint64(len(entries)))
 
 	rf.ResetElectionTimeout()
 	return int(currentTerm), true, remote.RemoteObjectError{}
@@ -337,14 +337,13 @@ func (rf *RaftPeer) AppendEntries(term int32, leaderId int, prevLogIndex int, pr
 
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError) {
 
-	// if commitIndex < len(rf.log) {
-	// 	return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
-	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	Debug(dLog, "S%d get committed cmd %d, %d\n", rf.id, commitIndex, len(rf.log))
-	if len(rf.log) != rf.commitIndex {
+	if len(rf.log) != int(rf.commitIndex.Load()) {
 		Debug(dWarn, "S%d inconsistent commitIndex %d, %d\n", rf.id, len(rf.log), rf.commitIndex)
 	}
-	if commitIndex < rf.commitIndex {
+	if commitIndex < int(rf.commitIndex.Load()) {
 		return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
 	}
 	return -1, remote.RemoteObjectError{
@@ -354,9 +353,9 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 
 func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 	status := StatusReport{
-		Index:     rf.commitIndex,
+		Index:     int(rf.commitIndex.Load()),
 		Term:      int(rf.currentTerm.Load()),
-		Leader:    rf.status == LEADER,
+		Leader:    atomic.LoadInt32(&rf.status) == LEADER,
 		CallCount: rf.service.GetCount(),
 	}
 	return status, remote.RemoteObjectError{}
@@ -365,7 +364,7 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError) {
 	Debug(dClient, "S%d new command %d\n", rf.id, cmd)
 
-	if rf.status != LEADER {
+	if atomic.LoadInt32(&rf.status) != LEADER {
 		return StatusReport{}, remote.RemoteObjectError{
 			Err: "not leader",
 		}
@@ -376,9 +375,9 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 	}
 
 	status := StatusReport{
-		Index:     rf.commitIndex,
+		Index:     int(rf.commitIndex.Load()),
 		Term:      int(rf.currentTerm.Load()),
-		Leader:    rf.status == LEADER,
+		Leader:    atomic.LoadInt32(&rf.status) == LEADER,
 		CallCount: rf.service.GetCount(),
 	}
 
@@ -388,12 +387,8 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 func (rf *RaftPeer) ResetElectionTimeout() {
 	Debug(dTimer, "S%d reset timer\n", rf.id)
 	timer := rand.Intn(150) + 150
-	if rf.electionTimeout != nil {
-		// 150-300ms timeout
-		rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
-	} else {
-		rf.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, rf.startElection)
-	}
+	rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
+
 }
 
 func (rf *RaftPeer) startElection() {
@@ -403,9 +398,8 @@ func (rf *RaftPeer) startElection() {
 	Debug(dTimer, "S%d timeout, become candidate\n", rf.id)
 	rf.ResetElectionTimeout()
 	rf.mu.Lock()
-	rf.status = CANDIDATE
+	atomic.SwapInt32(&rf.status, CANDIDATE)
 	term := rf.currentTerm.Add(1)
-	rf.votedFor = rf.id
 	rf.votedCount.Store(1)
 	rf.mu.Unlock()
 
@@ -420,7 +414,7 @@ func (rf *RaftPeer) startElection() {
 				if int(votes) == (len(rf.peers)+1)/2+1 {
 					// become leader
 					Debug(dLeader, "S%d received more than half votes, become leader\n", rf.id)
-					rf.status = LEADER
+					atomic.SwapInt32(&rf.status, LEADER)
 					// timer stop
 					Debug(dTimer, "S%d stop timer\n", rf.id)
 					go rf.LeaderThread()

@@ -62,6 +62,7 @@ import (
 	"math/rand"
 	"net"
 	"reflect"
+	"sync/atomic"
 	"time"
 )
 
@@ -234,7 +235,7 @@ type Service struct {
 	address         string
 	isRunning       bool
 	listener        net.Listener
-	successfulCalls int
+	successfulCalls atomic.Uint64
 }
 
 // build a new Service instance around a given struct of supported functions,
@@ -447,7 +448,7 @@ func (serv *Service) handleConnection(conn net.Conn) {
 		}
 	}
 	if SendReply(repMsg, ls) {
-		serv.successfulCalls++
+		serv.successfulCalls.Add(1)
 	}
 }
 
