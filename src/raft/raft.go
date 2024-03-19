@@ -81,7 +81,6 @@ type RaftPeer struct {
 	matchIndex []int
 	// states
 	service         *remote.Service
-	entryCh         chan Entry
 	status          int32
 	peers           []*RaftInterface
 	electionTimeout *time.Timer
@@ -127,11 +126,9 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		nextIndex:  []int{},
 		matchIndex: []int{},
 
-		service: nil,
-		mu:      &sync.RWMutex{},
-		status:  FOLLOWER,
-		entryCh: make(chan Entry, 1),
-		// vote:        make(chan bool, 1),
+		service:         nil,
+		mu:              &sync.RWMutex{},
+		status:          FOLLOWER,
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
 	}
@@ -223,21 +220,12 @@ func (rf *RaftPeer) LeaderThread() {
 	// 150-300ms timeout
 	timer := time.NewTimer(time.Duration(rand.Intn(50)+50) * time.Millisecond)
 
-	entries := []Entry{}
 	for atomic.LoadInt32(&rf.status) == LEADER {
-		select {
-		case <-timer.C:
-			rf.mu.Lock()
-			rf.log = append(rf.log, entries...)
-			rf.mu.Unlock()
-			entries = []Entry{}
-			rf.sendAppendEntries()
-			timer.Stop()
-			timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
-			Debug(dTimer, "S%d reset timer log %v cmt idx %d applied %d\n", rf.id, rf.log, rf.commitIndex.Load(), rf.lastApplied.Load())
-		case entry := <-rf.entryCh:
-			entries = append(entries, entry)
-		}
+		<-timer.C
+		rf.sendAppendEntries()
+		timer.Stop()
+		timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
+		Debug(dTimer, "S%d reset timer cmt idx %d applied %d\n", rf.id, rf.commitIndex.Load(), rf.lastApplied.Load())
 	}
 	timer.Stop()
 	Debug(dLeader, "S%d stop leader thread\n", rf.id)
@@ -262,16 +250,17 @@ func (rf *RaftPeer) sendAppendEntries() {
 				rf.log[logIndex:],
 				rf.commitIndex.Load(),
 			)
-			if success {
-				rf.nextIndex[i] = len(rf.log)
-				rf.matchIndex[i] = len(rf.log) - 1
+			if err == (remote.RemoteObjectError{}) {
+				if success {
+					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = len(rf.log) - 1
+				} else {
+					rf.nextIndex[i] = max(0, rf.nextIndex[i]-1)
+				}
 			} else {
-				rf.nextIndex[i]--
+				Debug(dError, "S%d sendAppendEntries error: %s\n", rf.id, err.Error())
 			}
 			rf.mu.RUnlock()
-			if err != (remote.RemoteObjectError{}) {
-				Debug(dError, "S%d sendAppendEntries error: %s\n", rf.id, err.Err)
-			}
 		}(i, p)
 	}
 	commitIndex := rf.commitIndex.Load()
@@ -356,9 +345,7 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if prevLogIndex >= logLen {
 		Debug(dLog, "S%d appendEntries LogIndex back off (%d >= %d)\n", rf.id, prevLogIndex, logLen)
-		return rf.currentTerm.Load(), false, remote.RemoteObjectError{
-			Err: "prevLogIndex is greater than log length",
-		}
+		return rf.currentTerm.Load(), false, remote.RemoteObjectError{}
 	}
 	//  If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 	if prevLogIndex >= 0 && rf.log[prevLogIndex].Term != prevLogTerm {
@@ -368,8 +355,8 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 
 	rf.mu.Lock()
 	rf.log = append(rf.log[:prevLogIndex+1], entries...)
+	Debug(dInfo, "S%d appendEntries log %v leaderCmt%d selfCmt%d applied %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load(), rf.lastApplied.Load())
 	rf.mu.Unlock()
-	Debug(dInfo, "S%d commits leaderCmt%d selfCmt%d\n", rf.id, leaderCommit, rf.commitIndex.Load())
 	if leaderCommit > rf.commitIndex.Load() {
 		rf.commitIndex.Store(min(leaderCommit, uint64(len(rf.log)-1)))
 	}
@@ -405,20 +392,25 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 }
 
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError) {
-	Debug(dClient, "S%d new command %d\n", rf.id, cmd)
 
 	if atomic.LoadInt32(&rf.status) != LEADER {
 		return StatusReport{}, remote.RemoteObjectError{
 			Err: "not leader",
 		}
 	}
-	rf.entryCh <- Entry{
+
+	rf.mu.Lock()
+	Debug(dClient, "S%d new command %d log %v\n", rf.id, cmd, rf.log)
+	rf.log = append(rf.log, Entry{
 		Term: rf.currentTerm.Load(),
 		Cmd:  cmd,
-	}
+	})
 
-	// TODO: remove this and implement properly
-	time.Sleep(1 * time.Second)
+	idx := len(rf.log) - 1
+	rf.mu.Unlock()
+	for rf.commitIndex.Load() < uint64(idx) {
+		time.Sleep(100 * time.Millisecond)
+	}
 	status := StatusReport{
 		Index:     int(rf.commitIndex.Load()),
 		Term:      int(rf.currentTerm.Load()),
@@ -430,7 +422,7 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 }
 
 func (rf *RaftPeer) ResetElectionTimeout() {
-	Debug(dTimer, "S%d reset timer log %v cmt idx %d applied %d\n", rf.id, rf.log, rf.commitIndex.Load(), rf.lastApplied.Load())
+	Debug(dTimer, "S%d reset timer\n", rf.id)
 	timer := rand.Intn(150) + 150
 	rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
 
