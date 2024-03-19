@@ -57,8 +57,8 @@ type StatusReport struct {
 //     and reply back to the Controller with a StatusReport struct as defined above. it must be
 //     implemented as given, or the test code will not function correctly.  more detail below
 type RaftInterface struct {
-	RequestVote     func(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (int, bool, remote.RemoteObjectError)
-	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (int, bool, remote.RemoteObjectError) // TODO: define function type
+	RequestVote     func(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError)
+	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, bool, remote.RemoteObjectError) // TODO: define function type
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -120,14 +120,17 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		id:          id,
 		currentTerm: atomic.Uint64{},
 		log:         []Entry{},
+
 		commitIndex: atomic.Uint64{},
 		lastApplied: atomic.Uint64{},
-		nextIndex:   []int{},
-		matchIndex:  []int{},
-		service:     nil,
-		mu:          &sync.RWMutex{},
-		status:      FOLLOWER,
-		entryCh:     make(chan Entry, 1),
+
+		nextIndex:  []int{},
+		matchIndex: []int{},
+
+		service: nil,
+		mu:      &sync.RWMutex{},
+		status:  FOLLOWER,
+		entryCh: make(chan Entry, 1),
 		// vote:        make(chan bool, 1),
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
@@ -224,10 +227,14 @@ func (rf *RaftPeer) LeaderThread() {
 	for atomic.LoadInt32(&rf.status) == LEADER {
 		select {
 		case <-timer.C:
-			rf.sendAppendEntries(entries)
+			rf.mu.Lock()
+			rf.log = append(rf.log, entries...)
+			rf.mu.Unlock()
 			entries = []Entry{}
+			rf.sendAppendEntries()
 			timer.Stop()
 			timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
+			Debug(dTimer, "S%d reset timer log %v cmt idx %d applied %d\n", rf.id, rf.log, rf.commitIndex.Load(), rf.lastApplied.Load())
 		case entry := <-rf.entryCh:
 			entries = append(entries, entry)
 		}
@@ -236,22 +243,46 @@ func (rf *RaftPeer) LeaderThread() {
 	Debug(dLeader, "S%d stop leader thread\n", rf.id)
 }
 
-func (rf *RaftPeer) sendAppendEntries(entries []Entry) {
-	Debug(dInfo, "S%d sendAppendEntries\n", rf.id)
-	rf.mu.Lock()
-	if len(entries) > 0 {
-		Debug(dLog, "S%d num entry %d\n", rf.id, len(rf.log))
-	}
-	rf.log = append(rf.log, entries...)
-	rf.mu.Unlock()
-	rf.commitIndex.Add(uint64(len(entries)))
-	for _, p := range rf.peers {
-		go func(p *RaftInterface) {
-			_, _, err := p.AppendEntries(rf.currentTerm.Load(), rf.id, 0, 0, entries, rf.commitIndex.Load())
+func (rf *RaftPeer) sendAppendEntries() {
+	Debug(dInfo, "S%d sendAppendEntries %v\n", rf.id, rf.nextIndex)
+	for i, p := range rf.peers {
+		go func(i int, p *RaftInterface) {
+			logIndex := rf.nextIndex[i]
+			prevLogIndex := logIndex - 1
+			var prevLogTerm uint64 = 0
+			rf.mu.RLock()
+			if logIndex > 0 {
+				prevLogTerm = rf.log[prevLogIndex].Term
+			}
+			_, success, err := p.AppendEntries(
+				rf.currentTerm.Load(),
+				rf.id,
+				prevLogIndex,
+				prevLogTerm,
+				rf.log[logIndex:],
+				rf.commitIndex.Load(),
+			)
+			if success {
+				rf.nextIndex[i] = len(rf.log)
+				rf.matchIndex[i] = len(rf.log) - 1
+			} else {
+				rf.nextIndex[i]--
+			}
+			rf.mu.RUnlock()
 			if err != (remote.RemoteObjectError{}) {
 				Debug(dError, "S%d sendAppendEntries error: %s\n", rf.id, err.Err)
 			}
-		}(p)
+		}(i, p)
+	}
+	commitIndex := rf.commitIndex.Load()
+	count := 1
+	for i := range rf.matchIndex {
+		if rf.matchIndex[i] > int(commitIndex) {
+			count++
+		}
+	}
+	if count > (len(rf.peers)+1)/2 {
+		rf.commitIndex.Add(1)
 	}
 }
 
@@ -278,7 +309,7 @@ func (rf *RaftPeer) sendAppendEntries(entries []Entry) {
 // the updated status after the new command was handled.
 // service implementation for RaftInterface
 
-func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (int, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError) {
 	// if term < currentTerm, reject
 	var currentTerm uint64
 	for {
@@ -288,8 +319,8 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 				break
 			}
 		} else {
-			Debug(dDrop, "S%d requestVote term %d <= %d, ignore\n", rf.id, term, currentTerm)
-			return int(currentTerm), false, remote.RemoteObjectError{
+			Debug(dTerm, "S%d requestVote term %d <= %d, ignore\n", rf.id, term, currentTerm)
+			return currentTerm, false, remote.RemoteObjectError{
 				Err: "term is less than current term",
 			}
 		}
@@ -297,10 +328,10 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 	Debug(dVote, "S%d vote for %d\n", rf.id, candidateId)
 	atomic.SwapInt32(&rf.status, FOLLOWER)
 	rf.ResetElectionTimeout()
-	return int(currentTerm), true, remote.RemoteObjectError{}
+	return currentTerm, true, remote.RemoteObjectError{}
 }
 
-func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (int, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
 	var currentTerm uint64
@@ -311,21 +342,39 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 				break
 			}
 		} else {
-			Debug(dDrop, "S%d appendEntries term %d <= %d, ignore\n", rf.id, term, currentTerm)
-			return int(rf.currentTerm.Load()), false, remote.RemoteObjectError{
+			Debug(dInfo, "S%d appendEntries term %d <= %d, ignore\n", rf.id, term, currentTerm)
+			return rf.currentTerm.Load(), false, remote.RemoteObjectError{
 				Err: "term is less than current term",
 			}
 		}
 	}
 
-	rf.mu.Lock()
-	Debug(dInfo, "S%d heartbeet <-%d, %d\n", rf.id, len(rf.log), len(entries))
-	rf.log = append(rf.log, entries...)
-	rf.mu.Unlock()
-	rf.commitIndex.Add(uint64(len(entries)))
-
 	rf.ResetElectionTimeout()
-	return int(currentTerm), true, remote.RemoteObjectError{}
+	rf.mu.RLock()
+	logLen := len(rf.log)
+	rf.mu.RUnlock()
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if prevLogIndex >= logLen {
+		Debug(dLog, "S%d appendEntries LogIndex back off (%d >= %d)\n", rf.id, prevLogIndex, logLen)
+		return rf.currentTerm.Load(), false, remote.RemoteObjectError{
+			Err: "prevLogIndex is greater than log length",
+		}
+	}
+	//  If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+	if prevLogIndex >= 0 && rf.log[prevLogIndex].Term != prevLogTerm {
+		Debug(dDrop, "S%d appendEntries LogTerm dismatch, drop log (%d != %d)\n", rf.id, rf.log[prevLogIndex].Term, prevLogTerm)
+		rf.log = rf.log[:prevLogIndex]
+	}
+
+	rf.mu.Lock()
+	rf.log = append(rf.log[:prevLogIndex+1], entries...)
+	rf.mu.Unlock()
+	Debug(dInfo, "S%d commits leaderCmt%d selfCmt%d\n", rf.id, leaderCommit, rf.commitIndex.Load())
+	if leaderCommit > rf.commitIndex.Load() {
+		rf.commitIndex.Store(min(leaderCommit, uint64(len(rf.log)-1)))
+	}
+
+	return currentTerm, true, remote.RemoteObjectError{}
 }
 
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError) {
@@ -333,10 +382,11 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	Debug(dLog, "S%d get committed cmd %d, %d\n", rf.id, commitIndex, len(rf.log))
-	if len(rf.log) != int(rf.commitIndex.Load()) {
-		Debug(dWarn, "S%d inconsistent commitIndex %d, %d\n", rf.id, len(rf.log), rf.commitIndex.Load())
-	}
-	if commitIndex < int(rf.commitIndex.Load()) {
+	// if len(rf.log) != int(rf.commitIndex.Load()) {
+	// 	Debug(dWarn, "S%d inconsistent commitIndex %d, %d\n", rf.id, len(rf.log), rf.commitIndex.Load())
+	// }
+	if commitIndex <= int(rf.commitIndex.Load()) {
+		Debug(dLog, "S%d get committed log %v at %d\n", rf.id, rf.log[commitIndex], commitIndex)
 		return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
 	}
 	return -1, remote.RemoteObjectError{
@@ -367,6 +417,8 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 		Cmd:  cmd,
 	}
 
+	// TODO: remove this and implement properly
+	time.Sleep(1 * time.Second)
 	status := StatusReport{
 		Index:     int(rf.commitIndex.Load()),
 		Term:      int(rf.currentTerm.Load()),
@@ -378,7 +430,7 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 }
 
 func (rf *RaftPeer) ResetElectionTimeout() {
-	Debug(dTimer, "S%d reset timer\n", rf.id)
+	Debug(dTimer, "S%d reset timer log %v cmt idx %d applied %d\n", rf.id, rf.log, rf.commitIndex.Load(), rf.lastApplied.Load())
 	timer := rand.Intn(150) + 150
 	rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
 
@@ -406,6 +458,11 @@ func (rf *RaftPeer) startElection() {
 					// become leader
 					Debug(dLeader, "S%d received more than half votes, become leader\n", rf.id)
 					atomic.SwapInt32(&rf.status, LEADER)
+					rf.matchIndex = make([]int, len(rf.peers))
+					rf.nextIndex = make([]int, len(rf.peers))
+					for i := range rf.nextIndex {
+						rf.nextIndex[i] = len(rf.log)
+					}
 					// timer stop
 					Debug(dTimer, "S%d stop timer\n", rf.id)
 					go rf.LeaderThread()
