@@ -225,14 +225,14 @@ func (rf *RaftPeer) LeaderThread() {
 		rf.sendAppendEntries()
 		timer.Stop()
 		timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
-		Debug(dTimer, "S%d reset timer cmt idx %d applied %d\n", rf.id, rf.commitIndex.Load(), rf.lastApplied.Load())
+		Debug(dTimer, "S%d reset timer\n", rf.id)
 	}
 	timer.Stop()
 	Debug(dLeader, "S%d stop leader thread\n", rf.id)
 }
 
 func (rf *RaftPeer) sendAppendEntries() {
-	Debug(dInfo, "S%d sendAppendEntries %v\n", rf.id, rf.nextIndex)
+	Debug(dInfo, "S%d sendAppendEntries %v cmt %d applied %d\n", rf.id, rf.nextIndex, rf.commitIndex.Load(), rf.lastApplied.Load())
 	for i, p := range rf.peers {
 		go func(i int, p *RaftInterface) {
 			logIndex := rf.nextIndex[i]
@@ -269,7 +269,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 		}
 	}
 	if count > (len(rf.peers)+1)/2 {
-		rf.commitIndex.Add(1)
+		rf.commitIndex.CompareAndSwap(commitIndex, commitIndex+1)
 	}
 }
 
@@ -278,9 +278,26 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 	// if term < currentTerm, reject
 	var currentTerm uint64
 	for {
+		rf.mu.RLock()
+		myLastLogIndex := len(rf.log) - 1
+		var myLastLogTerm uint64 = 0
+		if myLastLogIndex >= 0 {
+			myLastLogTerm = rf.log[myLastLogIndex].Term
+		}
+		rf.mu.RUnlock()
 		currentTerm = rf.currentTerm.Load()
 		if term > currentTerm {
-			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
+			if lastLogIndex < myLastLogIndex {
+				Debug(dTerm, "S%d requestVote log len %d < %d, ignore\n", rf.id, lastLogIndex, myLastLogIndex)
+				return currentTerm, false, remote.RemoteObjectError{
+					Err: "log length is less than current log length",
+				}
+			} else if lastLogIndex == myLastLogIndex && lastLogTerm < myLastLogTerm {
+				Debug(dTerm, "S%d requestVote last log term %d < %d, ignore\n", rf.id, lastLogTerm, myLastLogTerm)
+				return currentTerm, false, remote.RemoteObjectError{
+					Err: "last log term is less than current last log term",
+				}
+			} else if rf.currentTerm.CompareAndSwap(currentTerm, term) {
 				break
 			}
 		} else {
@@ -330,13 +347,13 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 		rf.log = rf.log[:prevLogIndex]
 	}
 
-	rf.mu.Lock()
-	rf.log = append(rf.log[:prevLogIndex+1], entries...)
-	Debug(dInfo, "S%d appendEntries log %v leaderCmt%d selfCmt%d applied %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load(), rf.lastApplied.Load())
-	rf.mu.Unlock()
 	if leaderCommit > rf.commitIndex.Load() {
 		rf.commitIndex.Store(min(leaderCommit, uint64(len(rf.log)-1)))
 	}
+	rf.mu.Lock()
+	rf.log = append(rf.log[:prevLogIndex+1], entries...)
+	Debug(dInfo, "S%d appendEntries log %v leaderCmt %d selfCmt %d applied %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load(), rf.lastApplied.Load())
+	rf.mu.Unlock()
 
 	return currentTerm, true, remote.RemoteObjectError{}
 }
@@ -391,12 +408,11 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 	}
 
 	rf.mu.Lock()
-	Debug(dClient, "S%d new command %d log %v\n", rf.id, cmd, rf.log)
 	rf.log = append(rf.log, Entry{
 		Term: rf.currentTerm.Load(),
 		Cmd:  cmd,
 	})
-
+	Debug(dClient, "S%d new command %d log %v\n", rf.id, cmd, rf.log)
 	idx := len(rf.log) - 1
 	rf.mu.Unlock()
 	status := StatusReport{
@@ -423,33 +439,40 @@ func (rf *RaftPeer) startElection() {
 	rf.ResetElectionTimeout()
 	atomic.SwapInt32(&rf.status, CANDIDATE)
 	term := rf.currentTerm.Add(1)
-	var votedCount atomic.Uint64
-	votedCount.Store(1)
+	votes := 1
 
 	// send requestVote to all other peers
+	rf.mu.RLock()
+	lastLogIndex := len(rf.log) - 1
+	var lastLogTerm uint64 = 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+	rf.mu.RUnlock()
+	var highestTerm uint64
 	for _, peer := range rf.peers {
-		go func(peer *RaftInterface) {
-			// todo: implement requestVote
-			_, accept, _ := peer.RequestVote(term, rf.id, 0, 0)
+		peerTerm, accept, _ := peer.RequestVote(term, rf.id, lastLogIndex, lastLogTerm)
+		highestTerm = max(highestTerm, peerTerm)
 
-			if accept {
-				votes := votedCount.Add(1)
-				if int(votes) == (len(rf.peers)+1)/2+1 {
-					// become leader
-					Debug(dLeader, "S%d received more than half votes, become leader\n", rf.id)
-					atomic.SwapInt32(&rf.status, LEADER)
-					rf.matchIndex = make([]int, len(rf.peers))
-					rf.nextIndex = make([]int, len(rf.peers))
-					for i := range rf.nextIndex {
-						rf.nextIndex[i] = len(rf.log)
-					}
-					// timer stop
-					Debug(dTimer, "S%d stop timer\n", rf.id)
-					go rf.LeaderThread()
-					return
+		if accept {
+			votes++
+			if votes == (len(rf.peers)+1)/2+1 {
+				// become leader
+				Debug(dLeader, "S%d received more than half votes, become leader\n", rf.id)
+				atomic.SwapInt32(&rf.status, LEADER)
+				rf.matchIndex = make([]int, len(rf.peers))
+				rf.nextIndex = make([]int, len(rf.peers))
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = len(rf.log)
 				}
+				// timer stop
+				Debug(dTimer, "S%d stop timer\n", rf.id)
+				go rf.LeaderThread()
 			}
-		}(peer)
+		}
+	}
+	if highestTerm > term {
+		rf.currentTerm.CompareAndSwap(term, highestTerm)
 	}
 }
 
