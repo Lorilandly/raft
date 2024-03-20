@@ -257,8 +257,6 @@ func (rf *RaftPeer) sendAppendEntries() {
 				} else {
 					rf.nextIndex[i] = max(0, rf.nextIndex[i]-1)
 				}
-			} else {
-				Debug(dError, "S%d sendAppendEntries error: %s\n", rf.id, err.Error())
 			}
 			rf.mu.RUnlock()
 		}(i, p)
@@ -275,29 +273,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 	}
 }
 
-// TODO: implement remote method calls from other Raft peers:
-//
 // # RequestVote -- as described in the Raft paper, called by other Raft peers
-//
-// # AppendEntries -- as described in the Raft paper, called by other Raft peers
-//
-// GetCommittedCmd -- called (only) by the Controller.  this method provides an input argument
-// `index`.  if the Raft peer has a log entry at the given `index`, and that log entry has been
-// committed (per the Raft algorithm), then the command stored in the log entry should be returned
-// to the Controller.  otherwise, the Raft peer should return the value 0, which is not a valid
-// command number and indicates that no committed log entry exists at that index
-//
-// GetStatus -- called (only) by the Controller.  this method takes no arguments and is essentially
-// a "getter" for the state of the Raft peer, including the Raft peer's current term, current last
-// log index, role in the Raft algorithm, and total number of remote calls handled since starting.
-// the method returns a `StatusReport` struct as defined at the top of this file.
-//
-// NewCommand -- called (only) by the Controller.  this method emulates submission of a new command
-// by a Raft client to this Raft peer, which should be handled and processed according to the rules
-// of the Raft algorithm.  once handled, the Raft peer should return a `StatusReport` struct with
-// the updated status after the new command was handled.
-// service implementation for RaftInterface
-
 func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError) {
 	// if term < currentTerm, reject
 	var currentTerm uint64
@@ -320,6 +296,7 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 	return currentTerm, true, remote.RemoteObjectError{}
 }
 
+// # AppendEntries -- as described in the Raft paper, called by other Raft peers
 func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
@@ -364,6 +341,11 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 	return currentTerm, true, remote.RemoteObjectError{}
 }
 
+// GetCommittedCmd -- called (only) by the Controller.  this method provides an input argument
+// `index`.  if the Raft peer has a log entry at the given `index`, and that log entry has been
+// committed (per the Raft algorithm), then the command stored in the log entry should be returned
+// to the Controller.  otherwise, the Raft peer should return the value 0, which is not a valid
+// command number and indicates that no committed log entry exists at that index
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError) {
 
 	rf.mu.RLock()
@@ -381,6 +363,10 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 	}
 }
 
+// GetStatus -- called (only) by the Controller.  this method takes no arguments and is essentially
+// a "getter" for the state of the Raft peer, including the Raft peer's current term, current last
+// log index, role in the Raft algorithm, and total number of remote calls handled since starting.
+// the method returns a `StatusReport` struct as defined at the top of this file.
 func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 	status := StatusReport{
 		Index:     int(rf.commitIndex.Load()),
@@ -391,6 +377,11 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError) {
 	return status, remote.RemoteObjectError{}
 }
 
+// NewCommand -- called (only) by the Controller.  this method emulates submission of a new command
+// by a Raft client to this Raft peer, which should be handled and processed according to the rules
+// of the Raft algorithm.  once handled, the Raft peer should return a `StatusReport` struct with
+// the updated status after the new command was handled.
+// service implementation for RaftInterface
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError) {
 
 	if atomic.LoadInt32(&rf.status) != LEADER {
@@ -408,11 +399,8 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 
 	idx := len(rf.log) - 1
 	rf.mu.Unlock()
-	for rf.commitIndex.Load() < uint64(idx) {
-		time.Sleep(100 * time.Millisecond)
-	}
 	status := StatusReport{
-		Index:     int(rf.commitIndex.Load()),
+		Index:     idx,
 		Term:      int(rf.currentTerm.Load()),
 		Leader:    atomic.LoadInt32(&rf.status) == LEADER,
 		CallCount: rf.service.GetCount(),
