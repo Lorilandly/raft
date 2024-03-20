@@ -482,7 +482,7 @@ func SendReply(reply ReplyMsg, ls *LeakySocket) bool {
 // GetCount returns the total number of remote calls served successfully by this Service.
 func (serv *Service) GetCount() int {
 	// TODO: return the total number of remote calls served successfully by this Service
-	return 0
+	return int(serv.successfulCalls.Load())
 }
 
 // IsRunning returns a boolean value indicating whether the service is currently running.

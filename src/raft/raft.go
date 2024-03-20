@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"math/rand"
 	"remote" // feel free to change to "remote" if appropriate for your dev environment
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -133,7 +134,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		electionTimeout: nil,
 	}
 
-	timer := rand.Intn(150) + 150
+	timer := rand.Intn(100) + 300
 	sobj.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, sobj.startElection)
 
 	for i := port - id; i < port-id+num; i++ {
@@ -218,13 +219,12 @@ func (rf *RaftPeer) Deactivate() {
 func (rf *RaftPeer) LeaderThread() {
 	rf.electionTimeout.Stop()
 	// 150-300ms timeout
-	timer := time.NewTimer(time.Duration(rand.Intn(50)+50) * time.Millisecond)
+	timer := time.NewTimer(time.Duration(rand.Intn(100)+100) * time.Millisecond)
 
 	for atomic.LoadInt32(&rf.status) == LEADER {
 		<-timer.C
+		timer.Reset(time.Duration(rand.Intn(100)+100) * time.Millisecond)
 		rf.sendAppendEntries()
-		timer.Stop()
-		timer.Reset(time.Duration(rand.Intn(50)+50) * time.Millisecond)
 		Debug(dTimer, "S%d reset timer\n", rf.id)
 	}
 	timer.Stop()
@@ -232,14 +232,18 @@ func (rf *RaftPeer) LeaderThread() {
 }
 
 func (rf *RaftPeer) sendAppendEntries() {
-	Debug(dInfo, "S%d sendAppendEntries %v cmt %d applied %d\n", rf.id, rf.nextIndex, rf.commitIndex.Load(), rf.lastApplied.Load())
+	Debug(dInfo, "S%d sendAppendEntries cmt %d applied %d\n", rf.id, rf.commitIndex.Load(), rf.lastApplied.Load())
+	var wg sync.WaitGroup
 	for i, p := range rf.peers {
-		go func(i int, p *RaftInterface) {
-			logIndex := rf.nextIndex[i]
-			prevLogIndex := logIndex - 1
+		wg.Add(1)
+		nextIndex := &rf.nextIndex[i]
+		matchIndex := &rf.matchIndex[i]
+		go func(nextIndex *int, matchIndex *int, p *RaftInterface) {
+			defer wg.Done()
+			prevLogIndex := *nextIndex - 1
 			var prevLogTerm uint64 = 0
 			rf.mu.RLock()
-			if logIndex > 0 {
+			if *nextIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex].Term
 			}
 			_, success, err := p.AppendEntries(
@@ -247,29 +251,27 @@ func (rf *RaftPeer) sendAppendEntries() {
 				rf.id,
 				prevLogIndex,
 				prevLogTerm,
-				rf.log[logIndex:],
+				rf.log[*nextIndex:],
 				rf.commitIndex.Load(),
 			)
 			if err == (remote.RemoteObjectError{}) {
 				if success {
-					rf.nextIndex[i] = len(rf.log)
-					rf.matchIndex[i] = len(rf.log) - 1
+					*nextIndex = len(rf.log)
+					*matchIndex = len(rf.log) - 1
 				} else {
-					rf.nextIndex[i] = max(0, rf.nextIndex[i]-1)
+					*nextIndex = max(0, *nextIndex-1)
 				}
 			}
 			rf.mu.RUnlock()
-		}(i, p)
+		}(nextIndex, matchIndex, p)
 	}
+	wg.Wait()
 	commitIndex := rf.commitIndex.Load()
-	count := 1
-	for i := range rf.matchIndex {
-		if rf.matchIndex[i] > int(commitIndex) {
-			count++
-		}
-	}
-	if count > (len(rf.peers)+1)/2 {
-		rf.commitIndex.CompareAndSwap(commitIndex, commitIndex+1)
+	idxArray := append([]int{int(commitIndex)}, rf.matchIndex...)
+	slices.Sort(idxArray)
+	median := idxArray[(len(idxArray)+1)/2]
+	if median > int(commitIndex) {
+		rf.commitIndex.CompareAndSwap(commitIndex, uint64(median))
 	}
 }
 
@@ -427,7 +429,7 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 
 func (rf *RaftPeer) ResetElectionTimeout() {
 	Debug(dTimer, "S%d reset timer\n", rf.id)
-	timer := rand.Intn(150) + 150
+	timer := rand.Intn(100) + 300
 	rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
 
 }
