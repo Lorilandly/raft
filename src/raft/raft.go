@@ -59,7 +59,7 @@ type StatusReport struct {
 //     implemented as given, or the test code will not function correctly.  more detail below
 type RaftInterface struct {
 	RequestVote     func(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError)
-	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, bool, remote.RemoteObjectError) // TODO: define function type
+	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError) // TODO: define function type
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -71,9 +71,10 @@ type RaftInterface struct {
 // TODO: define a struct to maintain the local state of a single Raft peer
 type RaftPeer struct {
 	// persistent state
-	id          int
-	currentTerm atomic.Uint64
-	log         []Entry
+	id           int
+	currentTerm  atomic.Uint64
+	firstTermIdx atomic.Uint64
+	log          []Entry
 	// volatile state on all
 	commitIndex atomic.Uint64
 	lastApplied atomic.Uint64
@@ -246,7 +247,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 			if *nextIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex].Term
 			}
-			_, success, err := p.AppendEntries(
+			term, termFirstIdx, success, err := p.AppendEntries(
 				rf.currentTerm.Load(),
 				rf.id,
 				prevLogIndex,
@@ -259,7 +260,9 @@ func (rf *RaftPeer) sendAppendEntries() {
 					*nextIndex = len(rf.log)
 					*matchIndex = len(rf.log) - 1
 				} else {
-					*nextIndex = max(0, *nextIndex-1)
+					if term <= rf.currentTerm.Load() {
+						*nextIndex = max(0, int(termFirstIdx))
+					}
 				}
 			}
 			rf.mu.RUnlock()
@@ -316,7 +319,7 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 }
 
 // # AppendEntries -- as described in the Raft paper, called by other Raft peers
-func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
 	var currentTerm uint64
@@ -324,11 +327,12 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 		currentTerm = rf.currentTerm.Load()
 		if term >= currentTerm {
 			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
+				rf.firstTermIdx.Store(uint64(len(rf.log)))
 				break
 			}
 		} else {
 			Debug(dInfo, "S%d appendEntries term %d <= %d, ignore\n", rf.id, term, currentTerm)
-			return rf.currentTerm.Load(), false, remote.RemoteObjectError{
+			return rf.currentTerm.Load(), rf.firstTermIdx.Load(), false, remote.RemoteObjectError{
 				Err: "term is less than current term",
 			}
 		}
@@ -341,7 +345,7 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if prevLogIndex >= logLen {
 		Debug(dLog, "S%d appendEntries LogIndex back off (%d >= %d)\n", rf.id, prevLogIndex, logLen)
-		return rf.currentTerm.Load(), false, remote.RemoteObjectError{}
+		return rf.currentTerm.Load(), rf.firstTermIdx.Load(), false, remote.RemoteObjectError{}
 	}
 	//  If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 	if prevLogIndex >= 0 && rf.log[prevLogIndex].Term != prevLogTerm {
@@ -357,7 +361,7 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 	Debug(dInfo, "S%d appendEntries log %v leaderCmt %d selfCmt %d applied %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load(), rf.lastApplied.Load())
 	rf.mu.Unlock()
 
-	return currentTerm, true, remote.RemoteObjectError{}
+	return currentTerm, rf.firstTermIdx.Load(), true, remote.RemoteObjectError{}
 }
 
 // GetCommittedCmd -- called (only) by the Controller.  this method provides an input argument
