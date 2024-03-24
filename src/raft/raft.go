@@ -218,6 +218,7 @@ func (rf *RaftPeer) Deactivate() {
 }
 
 func (rf *RaftPeer) LeaderThread() {
+	// follower timer stop
 	rf.electionTimeout.Stop()
 	// 150-300ms timeout
 	timer := time.NewTimer(time.Duration(rand.Intn(100)+100) * time.Millisecond)
@@ -449,16 +450,19 @@ func (rf *RaftPeer) startElection() {
 
 	// send requestVote to all other peers
 	rf.mu.RLock()
-	lastLogIndex := len(rf.log) - 1
+	logLen := len(rf.log)
+	lastLogIndex := logLen - 1
 	var lastLogTerm uint64 = 0
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
 	rf.mu.RUnlock()
-	var highestTerm uint64
 	for _, peer := range rf.peers {
 		peerTerm, accept, _ := peer.RequestVote(term, rf.id, lastLogIndex, lastLogTerm)
-		highestTerm = max(highestTerm, peerTerm)
+		if peerTerm > term {
+			rf.currentTerm.CompareAndSwap(term, peerTerm)
+			return
+		}
 
 		if accept {
 			votes++
@@ -469,16 +473,11 @@ func (rf *RaftPeer) startElection() {
 				rf.matchIndex = make([]int, len(rf.peers))
 				rf.nextIndex = make([]int, len(rf.peers))
 				for i := range rf.nextIndex {
-					rf.nextIndex[i] = len(rf.log)
+					rf.nextIndex[i] = logLen
 				}
-				// timer stop
-				Debug(dTimer, "S%d stop timer\n", rf.id)
 				go rf.LeaderThread()
 			}
 		}
-	}
-	if highestTerm > term {
-		rf.currentTerm.CompareAndSwap(term, highestTerm)
 	}
 }
 
