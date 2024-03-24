@@ -233,7 +233,7 @@ type Service struct {
 	isLossy         bool
 	isDelayed       bool
 	address         string
-	isRunning       bool
+	isRunning       atomic.Bool
 	listener        net.Listener
 	successfulCalls atomic.Uint64
 }
@@ -291,7 +291,7 @@ methods:
 		isLossy:   lossy,
 		isDelayed: delayed,
 		address:   fmt.Sprintf("localhost:%d", port),
-		isRunning: false,
+		isRunning: atomic.Bool{},
 		listener:  nil,
 	}
 
@@ -338,7 +338,7 @@ func (serv *Service) Start() error {
 	// 6. send the byte-string using `ls.SendObject`, noting that the configuration
 	//    of the LossySocket does not guarantee that this will work...
 
-	if serv.IsRunning() {
+	if !serv.isRunning.CompareAndSwap(false, true) {
 		fmt.Println("[WARNING]\tService is already running")
 		return nil
 	}
@@ -350,7 +350,6 @@ func (serv *Service) Start() error {
 		return errors.New("unable to start the server")
 	}
 	serv.listener = listener
-	serv.isRunning = true
 	go serv.serve()
 
 	return nil
@@ -361,8 +360,7 @@ func (serv *Service) Start() error {
 // It continuously accepts incoming connections and handles them in separate goroutines.
 func (serv *Service) serve() {
 	// start the multithreaded tcp server at the given address
-	fmt.Println("[INFO]\tserver running")
-	for serv.isRunning {
+	for serv.isRunning.Load() {
 		conn, err := serv.listener.Accept()
 
 		if err != nil {
@@ -458,7 +456,6 @@ func (serv *Service) handleConnection(conn net.Conn) {
 // It continues to retry sending the message until it is successfully sent or an error occurs.
 // Finally, it closes the socket.
 func SendReply(reply ReplyMsg, ls *LeakySocket) bool {
-	// fmt.Println("[INFO]\tsending reply:", reply)
 	defer ls.Close()
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -487,21 +484,20 @@ func (serv *Service) GetCount() int {
 
 // IsRunning returns a boolean value indicating whether the service is currently running.
 func (serv *Service) IsRunning() bool {
-	return serv.isRunning
+	return serv.isRunning.Load()
 }
 
 // Stop stops the Service, changes its state accordingly, and cleans up any resources.
 // If the Service is not running, it returns immediately.
 func (serv *Service) Stop() {
-	if !serv.isRunning {
+	if !serv.isRunning.CompareAndSwap(true, false) {
+		fmt.Println("[WARNING]\tService is already stopped")
 		return
 	}
-	fmt.Println("[INFO]\tstopping server")
 	err := serv.listener.Close()
 	if err != nil {
 		fmt.Println("[ERROR]\tunable to close the server: ", err)
 	}
-	serv.isRunning = false
 }
 
 // StubFactory -- make a client-side stub
