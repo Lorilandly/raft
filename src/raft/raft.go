@@ -135,7 +135,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 	}
 	sobj.commitIndex.Store(-1)
 
-	timer := rand.Intn(100) + 300
+	timer := rand.Intn(100) + 500
 	sobj.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, sobj.startElection)
 
 	for i := port - id; i < port-id+num; i++ {
@@ -221,11 +221,11 @@ func (rf *RaftPeer) LeaderThread() {
 	// follower timer stop
 	rf.electionTimeout.Stop()
 	// 150-300ms timeout
-	timer := time.NewTimer(time.Duration(rand.Intn(100)+100) * time.Millisecond)
+	timer := time.NewTimer(time.Duration(rand.Intn(100)+200) * time.Millisecond)
 
 	for atomic.LoadInt32(&rf.status) == LEADER {
 		<-timer.C
-		timer.Reset(time.Duration(rand.Intn(100)+100) * time.Millisecond)
+		timer.Reset(time.Duration(rand.Intn(100)+200) * time.Millisecond)
 		rf.sendAppendEntries()
 		Debug(dTimer, "S%d reset timer\n", rf.id)
 	}
@@ -234,7 +234,9 @@ func (rf *RaftPeer) LeaderThread() {
 }
 
 func (rf *RaftPeer) sendAppendEntries() {
-	Debug(dInfo, "S%d sendAppendEntries cmt %d\n", rf.id, rf.commitIndex.Load())
+	rf.mu.RLock()
+	Debug(dInfo, "S%d sendAppendEntries log %v nextIdx %v cmt %d\n", rf.id, rf.log, rf.nextIndex, rf.commitIndex.Load())
+	rf.mu.RUnlock()
 	var wg sync.WaitGroup
 	for i, p := range rf.peers {
 		wg.Add(1)
@@ -275,6 +277,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 	slices.Sort(idxArray)
 	median := idxArray[(len(idxArray)+1)/2]
 	if median > int(commitIndex) {
+		Debug(dCommit, "S%d commitIndex %d -> %d\n", rf.id, commitIndex, median)
 		rf.commitIndex.CompareAndSwap(commitIndex, int64(median))
 	}
 }
@@ -411,7 +414,7 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 		Term: rf.currentTerm.Load(),
 		Cmd:  cmd,
 	})
-	Debug(dClient, "S%d new command %d log %v\n", rf.id, cmd, rf.log)
+	Debug(dClient, "S%d new command %d\n", rf.id, cmd)
 	idx := len(rf.log) - 1
 	rf.mu.Unlock()
 	status := StatusReport{
@@ -426,7 +429,7 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
 
 func (rf *RaftPeer) ResetElectionTimeout() {
 	Debug(dTimer, "S%d reset timer\n", rf.id)
-	timer := rand.Intn(100) + 300
+	timer := rand.Intn(100) + 500
 	rf.electionTimeout.Reset(time.Duration(timer) * time.Millisecond)
 
 }
