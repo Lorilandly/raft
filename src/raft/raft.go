@@ -58,8 +58,8 @@ type StatusReport struct {
 //     and reply back to the Controller with a StatusReport struct as defined above. it must be
 //     implemented as given, or the test code will not function correctly.  more detail below
 type RaftInterface struct {
-	RequestVote     func(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError)
-	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError) // TODO: define function type
+	RequestVote     func(term int64, candidateId int, lastLogIndex int, lastLogTerm int64) (int64, bool, remote.RemoteObjectError)
+	AppendEntries   func(term int64, leaderId int, prevLogIndex int, prevLogTerm int64, entries []Entry, leaderCommit int64) (int64, int64, bool, remote.RemoteObjectError) // TODO: define function type
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -71,13 +71,12 @@ type RaftInterface struct {
 // TODO: define a struct to maintain the local state of a single Raft peer
 type RaftPeer struct {
 	// persistent state
-	id           int
-	currentTerm  atomic.Uint64
-	firstTermIdx atomic.Uint64
-	log          []Entry
+	id          int
+	currentTerm atomic.Int64
+	log         []Entry
 	// volatile state on all
-	commitIndex atomic.Uint64
-	lastApplied atomic.Uint64
+	commitIndex atomic.Int64
+	lastApplied atomic.Int64
 	// volatile state on leader
 	nextIndex  []int
 	matchIndex []int
@@ -90,7 +89,7 @@ type RaftPeer struct {
 }
 
 type Entry struct {
-	Term uint64
+	Term int64
 	Cmd  int
 }
 
@@ -119,11 +118,11 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 
 	sobj := &RaftPeer{
 		id:          id,
-		currentTerm: atomic.Uint64{},
+		currentTerm: atomic.Int64{},
 		log:         []Entry{},
 
-		commitIndex: atomic.Uint64{},
-		lastApplied: atomic.Uint64{},
+		commitIndex: atomic.Int64{},
+		lastApplied: atomic.Int64{},
 
 		nextIndex:  []int{},
 		matchIndex: []int{},
@@ -134,6 +133,7 @@ func NewRaftPeer(port int, id int, num int) *RaftPeer { // TODO: <---- change th
 		peers:           []*RaftInterface{},
 		electionTimeout: nil,
 	}
+	sobj.commitIndex.Store(-1)
 
 	timer := rand.Intn(100) + 300
 	sobj.electionTimeout = time.AfterFunc(time.Duration(timer)*time.Millisecond, sobj.startElection)
@@ -234,7 +234,7 @@ func (rf *RaftPeer) LeaderThread() {
 }
 
 func (rf *RaftPeer) sendAppendEntries() {
-	Debug(dInfo, "S%d sendAppendEntries cmt %d applied %d\n", rf.id, rf.commitIndex.Load(), rf.lastApplied.Load())
+	Debug(dInfo, "S%d sendAppendEntries cmt %d\n", rf.id, rf.commitIndex.Load())
 	var wg sync.WaitGroup
 	for i, p := range rf.peers {
 		wg.Add(1)
@@ -243,7 +243,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 		go func(nextIndex *int, matchIndex *int, p *RaftInterface) {
 			defer wg.Done()
 			prevLogIndex := *nextIndex - 1
-			var prevLogTerm uint64 = 0
+			var prevLogTerm int64 = 0
 			rf.mu.RLock()
 			if *nextIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex].Term
@@ -262,7 +262,7 @@ func (rf *RaftPeer) sendAppendEntries() {
 					*matchIndex = len(rf.log) - 1
 				} else {
 					if term <= rf.currentTerm.Load() {
-						*nextIndex = max(0, int(termFirstIdx))
+						*nextIndex = int(termFirstIdx)
 					}
 				}
 			}
@@ -275,14 +275,14 @@ func (rf *RaftPeer) sendAppendEntries() {
 	slices.Sort(idxArray)
 	median := idxArray[(len(idxArray)+1)/2]
 	if median > int(commitIndex) {
-		rf.commitIndex.CompareAndSwap(commitIndex, uint64(median))
+		rf.commitIndex.CompareAndSwap(commitIndex, int64(median))
 	}
 }
 
 // # RequestVote -- as described in the Raft paper, called by other Raft peers
-func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) RequestVote(term int64, candidateId int, lastLogIndex int, lastLogTerm int64) (int64, bool, remote.RemoteObjectError) {
 	// if term < currentTerm, reject
-	var currentTerm uint64
+	var currentTerm int64
 	for {
 		currentTerm = rf.currentTerm.Load()
 		if term > currentTerm {
@@ -290,7 +290,7 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 				break
 			}
 		} else {
-			Debug(dTerm, "S%d requestVote term %d <= %d, ignore\n", rf.id, term, currentTerm)
+			Debug(dTerm, "S%d requestVote S%d term %d <= %d, ignore\n", rf.id, candidateId, term, currentTerm)
 			return currentTerm, false, remote.RemoteObjectError{
 				Err: "term is less than current term",
 			}
@@ -303,20 +303,19 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 }
 
 // # AppendEntries -- as described in the Raft paper, called by other Raft peers
-func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError) {
+func (rf *RaftPeer) AppendEntries(term int64, leaderId int, prevLogIndex int, prevLogTerm int64, entries []Entry, leaderCommit int64) (int64, int64, bool, remote.RemoteObjectError) {
 	// if term == -1, it means the leader is sending heartbeat
 	// to reset timer
-	var currentTerm uint64
+	var currentTerm int64
 	for {
 		currentTerm = rf.currentTerm.Load()
 		if term >= currentTerm {
 			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
-				rf.firstTermIdx.Store(uint64(len(rf.log)))
 				break
 			}
 		} else {
 			Debug(dInfo, "S%d appendEntries term %d <= %d, ignore\n", rf.id, term, currentTerm)
-			return rf.currentTerm.Load(), rf.firstTermIdx.Load(), false, remote.RemoteObjectError{
+			return rf.currentTerm.Load(), 0, false, remote.RemoteObjectError{
 				Err: "term is less than current term",
 			}
 		}
@@ -329,23 +328,36 @@ func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, p
 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if prevLogIndex >= logLen {
 		Debug(dLog, "S%d appendEntries LogIndex back off (%d >= %d)\n", rf.id, prevLogIndex, logLen)
-		return rf.currentTerm.Load(), rf.firstTermIdx.Load(), false, remote.RemoteObjectError{}
+		return rf.currentTerm.Load(), int64(logLen), false, remote.RemoteObjectError{}
 	}
 	//  If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
 	if prevLogIndex >= 0 && rf.log[prevLogIndex].Term != prevLogTerm {
-		Debug(dDrop, "S%d appendEntries LogTerm dismatch, drop log (%d != %d)\n", rf.id, rf.log[prevLogIndex].Term, prevLogTerm)
-		rf.log = rf.log[:prevLogIndex]
+		Debug(dDrop, "S%d appendEntries LogTerm dismatch on idx %d, drop log (%d != %d)\n", rf.id, prevLogIndex, rf.log[prevLogIndex].Term, prevLogTerm)
+		// rf.log = rf.log[:prevLogIndex]
+		return rf.currentTerm.Load(), rf.getLastLogTermFirstIdx(), false, remote.RemoteObjectError{}
 	}
 
 	if leaderCommit > rf.commitIndex.Load() {
-		rf.commitIndex.Store(min(leaderCommit, uint64(len(rf.log)-1)))
+		rf.commitIndex.Store(min(leaderCommit, int64(len(rf.log)-1)))
 	}
 	rf.mu.Lock()
 	rf.log = append(rf.log[:prevLogIndex+1], entries...)
-	Debug(dInfo, "S%d appendEntries log %v leaderCmt %d selfCmt %d applied %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load(), rf.lastApplied.Load())
+	Debug(dInfo, "S%d appendEntries log %v leaderCmt %d selfCmt %d\n", rf.id, rf.log, leaderCommit, rf.commitIndex.Load())
 	rf.mu.Unlock()
 
-	return currentTerm, rf.firstTermIdx.Load(), true, remote.RemoteObjectError{}
+	return currentTerm, 0, true, remote.RemoteObjectError{}
+}
+
+func (rf *RaftPeer) getLastLogTermFirstIdx() int64 {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	lastLogTerm := rf.log[len(rf.log)-1].Term
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term != lastLogTerm {
+			return int64(i) + 1
+		}
+	}
+	return 0
 }
 
 // GetCommittedCmd -- called (only) by the Controller.  this method provides an input argument
@@ -358,9 +370,6 @@ func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectEr
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
 	Debug(dLog, "S%d get committed cmd %d, %d\n", rf.id, commitIndex, len(rf.log))
-	// if len(rf.log) != int(rf.commitIndex.Load()) {
-	// 	Debug(dWarn, "S%d inconsistent commitIndex %d, %d\n", rf.id, len(rf.log), rf.commitIndex.Load())
-	// }
 	if commitIndex <= int(rf.commitIndex.Load()) {
 		Debug(dLog, "S%d get committed log %v at %d\n", rf.id, rf.log[commitIndex], commitIndex)
 		return rf.log[commitIndex].Cmd, remote.RemoteObjectError{}
@@ -435,7 +444,7 @@ func (rf *RaftPeer) startElection() {
 	rf.mu.RLock()
 	logLen := len(rf.log)
 	lastLogIndex := logLen - 1
-	var lastLogTerm uint64 = 0
+	var lastLogTerm int64 = 0
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
