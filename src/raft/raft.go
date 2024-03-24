@@ -284,26 +284,9 @@ func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, 
 	// if term < currentTerm, reject
 	var currentTerm uint64
 	for {
-		rf.mu.RLock()
-		myLastLogIndex := len(rf.log) - 1
-		var myLastLogTerm uint64 = 0
-		if myLastLogIndex >= 0 {
-			myLastLogTerm = rf.log[myLastLogIndex].Term
-		}
-		rf.mu.RUnlock()
 		currentTerm = rf.currentTerm.Load()
 		if term > currentTerm {
-			if lastLogIndex < myLastLogIndex {
-				Debug(dTerm, "S%d requestVote log len %d < %d, ignore\n", rf.id, lastLogIndex, myLastLogIndex)
-				return currentTerm, false, remote.RemoteObjectError{
-					Err: "log length is less than current log length",
-				}
-			} else if lastLogIndex == myLastLogIndex && lastLogTerm < myLastLogTerm {
-				Debug(dTerm, "S%d requestVote last log term %d < %d, ignore\n", rf.id, lastLogTerm, myLastLogTerm)
-				return currentTerm, false, remote.RemoteObjectError{
-					Err: "last log term is less than current last log term",
-				}
-			} else if rf.currentTerm.CompareAndSwap(currentTerm, term) {
+			if rf.currentTerm.CompareAndSwap(currentTerm, term) {
 				break
 			}
 		} else {
