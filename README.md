@@ -1,3 +1,15 @@
+> ### Github Team
+> GOAT
+> ### Member
+> Lori (haoanli), Leo (minghaoc)
+
+## Potential Failure Scenarios & Limitation
+Our implementation of the raft algorithm is mostly robust. One of the failures that we spotted
+is that when there are inconsistencies in the logs, the peer should only delete one term in the 
+log at a time, but it instead deletes everything. This does not hurt the correctness of our 
+implementation, however, as the logs will still be replaced by the reference from the leader. 
+Nevertheless, it will affect the performance as the packet size grows larger
+
 ## Lab 2 - Raft, Go Version
 
 This file details the contents of the initial Lab 2 code repository and how to use it.

@@ -29,13 +29,14 @@ func initLog()
 TYPES
 
 type Entry struct {
-	Term uint64
+	Term int64
 	Cmd  int
 }
+    Entry struct represents a log entry in Raft.
 
 type RaftInterface struct {
-	RequestVote     func(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError)
-	AppendEntries   func(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError) // TODO: define function type
+	RequestVote     func(term int64, candidateId int, lastLogIndex int, lastLogTerm int64) (int64, bool, remote.RemoteObjectError)
+	AppendEntries   func(term int64, leaderId int, prevLogIndex int, prevLogTerm int64, entries []Entry, leaderCommit int64) (int64, int64, bool, remote.RemoteObjectError)
 	GetCommittedCmd func(int) (int, remote.RemoteObjectError)
 	GetStatus       func() (StatusReport, remote.RemoteObjectError)
 	NewCommand      func(int) (StatusReport, remote.RemoteObjectError)
@@ -77,13 +78,12 @@ type RaftInterface struct {
 
 type RaftPeer struct {
 	// persistent state
-	id           int
-	currentTerm  atomic.Uint64
-	firstTermIdx atomic.Uint64
-	log          []Entry
+	id          int
+	currentTerm atomic.Int64
+	log         []Entry
 	// volatile state on all
-	commitIndex atomic.Uint64
-	lastApplied atomic.Uint64
+	commitIndex atomic.Int64
+	lastApplied atomic.Int64
 	// volatile state on leader
 	nextIndex  []int
 	matchIndex []int
@@ -94,72 +94,37 @@ type RaftPeer struct {
 	electionTimeout *time.Timer
 	mu              *sync.RWMutex
 }
-    you will need to define a struct that contains the parameters/variables that
-    define and explain the current status of each Raft peer. it doesn't matter
-    what you call this struct, and the test code doesn't really care what state
-    it contains, so this part is up to you. TODO: define a struct to maintain
-    the local state of a single Raft peer
+    RaftPeer struct represents the local state of a single Raft peer.
 
 func NewRaftPeer(port int, id int, num int) *RaftPeer
-    `NewRaftPeer` -- this method should create an instance of the above struct
-    and return a pointer to it back to the Controller, which calls this method.
-    this allows the Controller to create, interact with, and control the
-    configuration as needed. this method takes three parameters: -- port: this
-    is the service port number where this Raft peer will listen for incoming
-    messages -- id: this is the ID (or index) of this Raft peer in the peer
-    group, ranging from 0 to num-1 -- num: this is the number of Raft peers in
-    the peer group (num > id)
+    NewRaftPeer creates a new instance of RaftPeer and returns a pointer
+    to it. It initializes the initial state of the Raft peer, creates the
+    remote.Service and remote.StubFactory components, but does not start the
+    service.
+
+    Parameters: - port: The service port number where this Raft peer will listen
+    for incoming messages. - id: The ID (or index) of this Raft peer in the peer
+    group, ranging from 0 to num-1. - num: The number of Raft peers in the peer
+    group (num > id).
+
+    Returns: - A pointer to the created RaftPeer.
 
 func (rf *RaftPeer) Activate()
-    `Activate` -- this method operates on your Raft peer struct and initiates
-    functionality to allow the Raft peer to interact with others. before the
-    peer is activated, it can have internal algorithm state, but it cannot make
-    remote calls using its stubs or receive remote calls using its underlying
-    remote.Service interface. in essence, when not activated, the Raft peer is
-    "sleeping" from the perspective of any other Raft peer.
+    Activate initiates the functionality of the Raft peer to allow it to
+    interact with other peers. It starts the remote.Service interface to support
+    remote calls from other Raft peers. This method should be called by the
+    Controller to "wake up" the Raft peer and allow it to start interacting with
+    other peers.
 
-    this method is used exclusively by the Controller whenever it needs to "wake
-    up" the Raft peer and allow it to start interacting with other Raft peers.
-    this is used to emulate connecting a new peer to the network or recovery of
-    a previously failed peer.
-
-    when this method is called, the Raft peer should do whatever is necessary
-    to enable its remote.Service interface to support remote calls from other
-    Raft peers as soon as the method returns (i.e., if it takes time for the
-    remote.Service to start, this method should not return until that happens).
-    the method should not otherwise block the Controller, so it may be useful to
-    spawn go routines from this method to handle the on-going operation of the
-    Raft peer until the remote.Service stops.
-
-    given an instance `rf` of your Raft peer struct, the Controller will
-    call this method as `rf.Activate()`, so you should define this method
-    accordingly. NOTE: this is _not_ a remote call using the `remote.Service`
-    interface of the Raft peer. it uses direct method calls from the Controller,
-    and is used purely for the purposes of the test code. you should not be
-    using this method for any messaging between Raft peers.
-
-    TODO: implement the `Activate` method
-
-func (rf *RaftPeer) AppendEntries(term uint64, leaderId int, prevLogIndex int, prevLogTerm uint64, entries []Entry, leaderCommit uint64) (uint64, uint64, bool, remote.RemoteObjectError)
+func (rf *RaftPeer) AppendEntries(term int64, leaderId int, prevLogIndex int, prevLogTerm int64, entries []Entry, leaderCommit int64) (int64, int64, bool, remote.RemoteObjectError)
     # AppendEntries -- as described in the Raft paper, called by other Raft peers
 
 func (rf *RaftPeer) Deactivate()
-    `Deactivate` -- this method performs the "inverse" operation to `Activate`,
-    namely to emulate disconnection / failure of the Raft peer. when called,
-    the Raft peer should effectively "go to sleep", meaning it should stop its
-    underlying remote.Service interface, including shutting down the listening
-    socket, causing any further remote calls to this Raft peer to fail due to
-    connection error. when deactivated, a Raft peer should not make or receive
-    any remote calls, and any execution of the Raft protocol should effectively
-    pause. however, local state should be maintained, meaning if a Raft node was
-    the LEADER when it was deactivated, it should still believe it is the leader
-    when it reactivates.
-
-    given an instance `rf` of your Raft peer struct, the Controller will
-    call this method as `rf.Deactivate()`, so you should define this method
-    accordingly. Similar notes / details apply here as with `Activate`
-
-    TODO: implement the `Deactivate` method
+    Deactivate performs the "inverse" operation to Activate, effectively "going
+    to sleep" and stopping the remote.Service interface. When deactivated,
+    a Raft peer should not make or receive any remote calls, and any execution
+    of the Raft protocol should effectively pause. However, local state should
+    be maintained.
 
 func (rf *RaftPeer) GetCommittedCmd(commitIndex int) (int, remote.RemoteObjectError)
     GetCommittedCmd -- called (only) by the Controller. this method provides
@@ -178,6 +143,12 @@ func (rf *RaftPeer) GetStatus() (StatusReport, remote.RemoteObjectError)
     method returns a `StatusReport` struct as defined at the top of this file.
 
 func (rf *RaftPeer) LeaderThread()
+    LeaderThread is a goroutine that runs when the RaftPeer is in the leader
+    state. It stops the follower timer, sets a timeout between 150-300ms,
+    and repeatedly sends AppendEntries RPCs to all other peers in the cluster.
+    It resets the timer after each timeout and continues until the RaftPeer's
+    status changes from leader. Finally, it stops the timer and logs a message
+    indicating that the leader thread has stopped.
 
 func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
     NewCommand -- called (only) by the Controller. this method emulates
@@ -187,14 +158,34 @@ func (rf *RaftPeer) NewCommand(cmd int) (StatusReport, remote.RemoteObjectError)
     updated status after the new command was handled. service implementation for
     RaftInterface
 
-func (rf *RaftPeer) RequestVote(term uint64, candidateId int, lastLogIndex int, lastLogTerm uint64) (uint64, bool, remote.RemoteObjectError)
+func (rf *RaftPeer) RequestVote(term int64, candidateId int, lastLogIndex int, lastLogTerm int64) (int64, bool, remote.RemoteObjectError)
     # RequestVote -- as described in the Raft paper, called by other Raft peers
 
 func (rf *RaftPeer) ResetElectionTimeout()
+    ResetElectionTimeout resets the election timer for the Raft peer.
+    It generates a random timeout value between 500 and 600 milliseconds, and if
+    the peer is not the leader, it resets the election timeout to the generated
+    value. This method is called to prevent the peer from triggering an election
+    prematurely.
+
+func (rf *RaftPeer) getLastLogTermFirstIdx() int64
+    getLastLogTermFirstIdx returns the index of the first log entry with the
+    last log term. It searches the log entries in reverse order and returns
+    the index of the first entry with a different term than the last log term.
+    If no such entry is found, it returns 0.
 
 func (rf *RaftPeer) sendAppendEntries()
+    sendAppendEntries sends append entries RPCs to all peers in parallel.
+    It retrieves the necessary information from the RaftPeer struct and uses
+    it to construct the RPC request. The function updates the nextIndex and
+    matchIndex for each peer based on the response received. It also updates the
+    commitIndex if necessary.
 
 func (rf *RaftPeer) startElection()
+    startElection is called by a Raft peer to initiate an election. It resets
+    the election timer, becomes a candidate, and sends requestVote RPCs to all
+    other peers. If the peer receives a majority of votes, it becomes the leader
+    and starts the leader thread.
 
 type StatusReport struct {
 	Index     int
