@@ -44,7 +44,7 @@ func NewController(t *testing.T, num int, prt int) *Controller {
         go RaftControl(portI, i, num, ctrl.ch[i])
         
         ctrl.peers[i] = &RaftInterface{}
-        errI := remote.StubFactory(ctrl.peers[i], "localhost:" + strconv.Itoa(portI), false, false)
+        errI := remote.StubFactory(ctrl.peers[i], "localhost:" + strconv.Itoa(portI), true, true)
         if errI != nil {
             ctrl.cleanup()
             ctrl.t.Fatalf("Cannot create Controller stub for Raft peer: " + errI.Error())
